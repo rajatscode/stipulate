@@ -184,19 +184,24 @@ models = [
     "myapp.models:Game",
     "myapp.models:Cell",
 ]
-mutations = [
-    "myapp.game:reveal_cell",
-    "myapp.game:flag_cell",
-    "myapp.game:check_win",
-    "myapp.game:delete_game",
+actions = [
+    "myapp.actions:reveal_action",
+    "myapp.actions:flag_action",
+    "myapp.actions:check_win_action",
+    "myapp.actions:delete_game_action",
 ]
 invariants = [
     "myapp.invariants:revealed_mine_means_lost",
     "myapp.invariants:mine_counts_accurate",
 ]
+seeds = [
+    "myapp.seeds:game_seed",
+    "myapp.seeds:cell_seeds",
+]
 ```
 
-FastAPI route auto-discovery is a future improvement, not v1.
+Actions are the core registration unit, not raw functions. FastAPI route
+auto-discovery is a future improvement, not v1.
 
 ## Action Model
 
@@ -204,41 +209,46 @@ The biggest conceptual gap in "just fuzz your mutations" is: how does
 the explorer know which calls are valid, what arguments to pass, and
 which errors mean "bad input" vs "real bug"?
 
-Stipulate requires an explicit action model for each mutation:
+Stipulate requires an explicit action model for each mutation. Actions
+are the core abstraction — config and pytest register actions, not raw
+functions.
 
 ```python
-from stipulate import action, from_seed, from_field
+from stipulate import action, from_seed, from_entity
 
 reveal_action = action(
-    fn=reveal_cell,
+    fn='myapp.game:reveal_cell',  # import path, not reference (for mutation patching)
     params={
         'game_id': from_seed(Game),
-        'row': from_field(Cell.row, where=lambda c: c.state == 'hidden'),
-        'col': from_field(Cell.col, where=lambda c: c.state == 'hidden'),
+        'cell': from_entity(Cell, where=lambda c: c.state == 'hidden'),
+        # row and col projected from the same Cell record
+        'row': lambda cell: cell.row,
+        'col': lambda cell: cell.col,
     },
     pre=lambda db, game_id: db.get(Game, game_id).status == 'playing',
-    discard=[NoResultFound],  # invalid coordinates → skip, not violation
+    discard=[NoResultFound],
 )
 
 flag_action = action(
-    fn=flag_cell,
+    fn='myapp.game:flag_cell',
     params={
         'game_id': from_seed(Game),
-        'row': from_field(Cell.row, where=lambda c: c.state == 'hidden'),
-        'col': from_field(Cell.col, where=lambda c: c.state == 'hidden'),
+        'cell': from_entity(Cell, where=lambda c: c.state == 'hidden'),
+        'row': lambda cell: cell.row,
+        'col': lambda cell: cell.col,
     },
     pre=lambda db, game_id: db.get(Game, game_id).status == 'playing',
     discard=[NoResultFound],
 )
 
 check_win_action = action(
-    fn=check_win,
+    fn='myapp.game:check_win',
     params={'game_id': from_seed(Game)},
     # no precondition — check_win is always callable (that's the bug)
 )
 
 delete_game_action = action(
-    fn=delete_game,
+    fn='myapp.game:delete_game',
     params={'game_id': from_seed(Game)},
 )
 ```
@@ -246,44 +256,83 @@ delete_game_action = action(
 **Parameter binding:**
 
 - `from_seed(Model)` — picks an ID from seeded entities of that type.
-- `from_field(Model.col, where=...)` — picks a value that exists in the
-  DB matching the filter. Ensures generated calls reference real state.
+- `from_entity(Model, where=...)` — draws a whole record from the DB
+  matching the filter. Derived params project fields from the same
+  record, ensuring compound identifiers (row + col) are consistent.
 - `from_values([...])` — explicit value list for non-schema params.
 
-**Preconditions (`pre`):**
+Functions are specified by import path string, not direct reference.
+This allows mutation testing to patch at the module level and have
+actions pick up the patched version on each call.
 
-A function that checks whether the call is valid given current DB state.
-If `pre` returns False, the explorer skips this action for this step.
-This prevents wasting exploration budget on calls that will trivially
-fail (e.g., revealing on an already-lost game).
+**Preconditions and guard probing:**
 
-Preconditions are NOT invariants — they don't assert correctness, they
-filter invalid inputs. A mutation that should be guarded but isn't
-(like check_win not checking game.status) is a bug that the tool finds
-when a forbidden transition fires.
+Preconditions (`pre`) declare what the developer THINKS is a valid
+call. The explorer uses this in two modes:
+
+- **Guarded exploration:** respects `pre`. Models valid user workflows.
+  Finds bugs in legitimate sequences (like check_win overwriting a
+  loss). This is the primary exploration mode.
+
+- **Unguarded exploration:** ignores `pre` and calls the function with
+  any type-valid arguments (e.g., flag_cell on a revealed cell). Finds
+  missing guards — code that SHOULD reject the call but doesn't. If an
+  unguarded call triggers a forbidden transition, that's a missing
+  guard bug.
+
+Both modes run during exploration. Budget split is configurable
+(default: 70% guarded, 30% unguarded). The demo's flag_cell bug
+(`revealed → flagged`) is found by unguarded exploration — the action
+model says "only flag hidden cells," so when calling without that
+filter triggers a forbidden transition, the tool reports:
+
+> flag_cell(revealed_cell) succeeded but caused forbidden transition
+> Cell.state: revealed → flagged. Missing guard in flag_cell.
+
+This resolves the tension: the cleaner the action model, the better it
+identifies which unguarded calls reveal missing guards.
 
 **Discard list:**
 
-Exceptions that indicate an invalid input combination was generated
-despite parameter binding and preconditions. These are silently
-skipped. Any exception NOT on the discard list is reported as an
-exploration error (likely a bug in the mutation or the action model).
+Per-action exceptions that indicate an impossible input combination
+despite parameter binding. Silently skipped. Any exception NOT on the
+action's discard list is reported as an exploration finding.
+
+There are no generic discard rules. Each action declares its own.
 
 **Transaction semantics:**
 
-The exploration engine provides a Session wrapped in a SAVEPOINT. When
-mutation functions call `db.commit()`, the commit is real within the
-savepoint scope. After checking invariants and recording transitions,
-the engine rolls back to the savepoint before the next sequence. This
-means:
+The engine uses SQLAlchemy's `connection.begin_nested()` to create a
+SAVEPOINT before each exploration sequence. The Session is bound to
+this connection. When mutation functions call `db.commit()`:
 
-- Mutation functions don't need modification — they commit normally.
-- Each exploration sequence starts from a clean seed state.
-- Shrinking replays sequences from the same initial state.
-- No test-specific "don't commit" mode is needed.
+- SQLAlchemy releases the inner savepoint (changes visible within the
+  connection's transaction).
+- The engine reads DB state for invariant checks.
+- After the sequence completes, the engine rolls back the outer
+  transaction, restoring the seed state.
 
-This is the same pattern as Django's `TestCase` (wrapped transactions)
-and pytest-django's `transaction=True` mode.
+Concretely:
+```python
+with engine.connect() as conn:
+    with conn.begin():  # outer transaction
+        seed_database(conn)
+        for sequence in generate_sequences():
+            savepoint = conn.begin_nested()
+            session = Session(bind=conn)
+            try:
+                run_sequence(session, sequence)
+                check_invariants(session)
+                record_transitions(session)
+            finally:
+                savepoint.rollback()  # restore seed state
+```
+
+This means:
+- Mutation functions commit normally (flush + savepoint release).
+- Each sequence starts from clean seed state.
+- Shrinking replays from the same initial state.
+- No test-specific "don't commit" mode needed.
 
 ## What the Tool Does
 
@@ -374,7 +423,7 @@ def cell_seeds(game: Game):
     return cells
 ```
 
-Seed overrides are registered in config alongside models and mutations.
+Seed overrides are registered in config alongside models and actions.
 If a model has no seed override, the generator falls back to
 type-derived values. If a model has domain constraints that type
 derivation can't satisfy, the exploration fails fast with a clear error
@@ -419,24 +468,24 @@ default, because it is unsound for helper functions, dynamic SQL,
 joins across relationships, and indirect dependencies.
 
 1. Create test DB + seed data from schema / overrides
-2. For each mutation sequence of length 1..N:
-   a. Call mutation function with generated arguments
-   b. If the call raises a domain error (NoResultFound, ValueError,
-      IntegrityError), discard this step as an invalid input
-      combination — do not count it as a violation or coverage hit
-   c. Check all invariants (schema-derived + custom) against the DB
-   d. Check forbidden transitions against recorded state changes
-   e. Record state transitions (column value changes)
-   f. If violation → record, shrink, report
-3. Coverage-directed: bias toward uncovered transitions
-4. Adversarial: for each invariant, AST-analyze what state would
-   violate it, search for mutation sequences reaching that state
-
-Expected domain errors are discarded, not reported. The explorer
-generates arguments from the seed data (valid FK references, valid
-enum values) so most calls succeed, but invalid combinations are
-inevitable and should be silently skipped. Unexpected errors (e.g.,
-AttributeError, TypeError) are reported as exploration bugs.
+2. For each step, pick an action and generate arguments:
+   a. **Guarded** (70% of budget): respect the action's `pre` and
+      parameter filters. Models valid user workflows.
+   b. **Unguarded** (30% of budget): ignore `pre`, draw any type-valid
+      arguments from the DB. Probes for missing guards.
+3. Call the action's function with generated arguments:
+   a. If the call raises an exception on the action's `discard` list,
+      skip this step silently (invalid input combination).
+   b. If the call raises an undeclared exception, report it as an
+      exploration finding (likely a bug or missing discard).
+   c. Otherwise, the call succeeded.
+4. Check all invariants (schema-derived + custom) against the DB.
+5. Check forbidden transitions against recorded state changes.
+6. Record state transitions (column value changes).
+7. If violation → record, shrink, report.
+8. Coverage-directed: bias toward uncovered transitions.
+9. Adversarial: for each invariant, AST-analyze what state would
+   violate it, search for mutation sequences reaching that state.
 
 **API mode (CI, thorough):**
 
@@ -622,10 +671,12 @@ During exploration:
    return value (or raises the mock exception).
 3. If the mutation doesn't catch a declared exception (e.g., timeout
    propagates out of submit_score), that is a valid exploration path —
-   the mutation "failed." The engine treats this like any other
-   exception: if it's on the action's discard list, skip; otherwise
-   check invariants against the DB state at the point of failure.
-   Uncaught external exceptions often reveal missing error handling.
+   the mutation "failed." The engine flushes the session (to surface
+   any pending writes), then checks invariants against the DB state.
+   If the session is in a broken state (e.g., transaction aborted),
+   the engine reports the exception as a finding: "submit_score does
+   not handle timeout — exception propagates, leaving DB in unknown
+   state." Uncaught external exceptions reveal missing error handling.
 4. Checks all invariants after each outcome.
 5. Cross-product: if the game is in 4 possible states × 4 leaderboard
    outcomes = 16 combinations, all explored automatically.
@@ -667,12 +718,15 @@ Schemas and code evolve. Stipulate detects when changes create gaps:
 ```python
 # conftest.py
 from stipulate.pytest import create_explorer
+from myapp.actions import (
+    reveal_action, flag_action, check_win_action, delete_game_action
+)
 
 @pytest.fixture
 def explorer(test_db):
     return create_explorer(
         models=[Game, Cell],
-        mutations=[reveal_cell, flag_cell, check_win, delete_game],
+        actions=[reveal_action, flag_action, check_win_action, delete_game_action],
         invariants=[revealed_mine_means_lost, mine_counts_accurate],
         db=test_db,
         budget=500,
@@ -794,8 +848,10 @@ VIOLATION: [forbidden] Game.status: lost → won
   non-mines revealed → set status='won'. No loss-state guard.
 
 VIOLATION: [forbidden] Cell.state: revealed → flagged
-  After: reveal_cell(1, 1) → flag_cell(1, 1)
-  flag_cell() flagged an already-revealed cell — no guard.
+  After: reveal_cell(1, 1) → flag_cell(1, 1)  [unguarded]
+  flag_cell() succeeded on a revealed cell — no guard.
+  (Found via unguarded exploration: action model says "only flag hidden
+   cells," but the function accepts any cell.)
 
 VIOLATION: [schema] orphan_detection
   After: delete_game('g1')
