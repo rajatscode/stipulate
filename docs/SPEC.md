@@ -194,6 +194,9 @@ invariants = [
     "myapp.invariants:revealed_mine_means_lost",
     "myapp.invariants:mine_counts_accurate",
 ]
+postconditions = [
+    "myapp.invariants:win_detected",
+]
 seeds = [
     "myapp.seeds:game_seed",
     "myapp.seeds:cell_seeds",
@@ -353,6 +356,13 @@ This means:
 - Shrinking replays sequences from the same initial state.
 - No test-specific session mode needed in mutation code.
 
+**Limitation:** commit interception means direct mode does not exercise
+real commit behavior: `after_commit` hooks, session expiration,
+transaction boundary effects, and code that depends on actual commit
+semantics may behave differently. This is acceptable for the
+exploration feedback loop. API mode (Schemathesis through HTTP) uses
+real commits and catches commit-dependent bugs.
+
 ## What the Tool Does
 
 ### 1. Schema Introspection
@@ -502,17 +512,21 @@ joins across relationships, and indirect dependencies.
 3. Snapshot tracked column values (before state).
 4. Call the action's function with generated arguments:
    a. If the call raises an exception on the action's `discard` list,
-      skip this step silently (invalid input combination).
-   b. If the call raises an undeclared exception, report it as an
-      exploration finding (likely a bug or missing discard).
-   c. Otherwise, the call succeeded — flush the session.
+      skip this step silently (generator artifact).
+   b. If the call is **unguarded** and raises an exception on the
+      action's `rejects` list, skip silently (function correctly
+      rejected invalid input — the guard exists).
+   c. If the call raises an undeclared exception, report it as an
+      exploration finding (likely a bug or missing discard/rejects).
+   d. Otherwise, the call succeeded — flush the session.
 5. Snapshot tracked column values again (after state).
 6. Diff before/after → record state transitions.
 7. Check forbidden transitions against the diff.
 8. Check all invariants (schema-derived + custom) against the DB.
-9. If violation → record, shrink, report.
-10. Coverage-directed: bias toward uncovered transitions.
-11. Adversarial: for each invariant, AST-analyze what state would
+9. Check postconditions bound to the action that just ran.
+10. If violation → record, shrink, report.
+11. Coverage-directed: bias toward uncovered transitions.
+12. Adversarial: for each invariant, AST-analyze what state would
     violate it, search for mutation sequences reaching that state.
 
 **API mode (CI, thorough):**
@@ -760,6 +774,7 @@ def explorer(test_db):
         models=[Game, Cell],
         actions=[reveal_action, flag_action, check_win_action, delete_game_action],
         invariants=[revealed_mine_means_lost, mine_counts_accurate],
+        postconditions=[win_detected],
         db=test_db,
         budget=500,
     )
@@ -770,11 +785,12 @@ def test_game_invariants(explorer):
 
     assert result.violations == []
 
-def test_mutation_score(explorer):
+def test_no_unexpected_survivors(explorer):
     result = explorer.mutate()
 
-    assert result.score > 70
-    assert result.survived == []
+    # Don't gate on a score percentage — gate on specific survivors
+    # you've decided are acceptable vs unacceptable
+    assert result.unexpected_survivors == []
 ```
 
 Zero hand-written test scenarios.
@@ -926,10 +942,9 @@ VIOLATION: [schema] orphan_detection
   parent without cleaning up child Cells (SQLite FK enforcement is off).
 
 Transition coverage (excluding forbidden):
-  Observed: 4   Unseen: 3
-    ready → playing  (unseen — no start_game action)
-    ready → lost     (unseen)
-    ready → won      (unseen)
+  Game.status: 2 observed / 8 non-forbidden pairs
+  Cell.state:  2 observed / 4 non-forbidden pairs
+  Total: 4 observed, 8 unseen
 ```
 
 Two business logic bugs (check_win ignores loss, flag_cell has no
