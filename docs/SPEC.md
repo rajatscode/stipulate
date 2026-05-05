@@ -285,7 +285,96 @@ Survived:
       the write actually persisted. Consider a temporal invariant.
 ```
 
-### 7. pytest Integration
+### 7. External Operations and Mock Integration
+
+Mutations that call external services (payment processors, email APIs,
+third-party data providers) are where integration tests live today.
+Developers hand-write scenarios: "mock the payment API to return
+declined, call place_order, assert order status is payment_failed."
+
+Stipulate replaces the scenario-writing with declared outcome domains.
+The developer declares what outcomes an external call can produce.
+The explorer mocks the call and exercises every outcome against every
+reachable state, checking invariants after each.
+
+```python
+from stipulate import external
+
+@external(
+    outcomes={
+        'success': PaymentResult(status='paid', charge_id='ch_xxx'),
+        'declined': PaymentResult(status='declined', reason='insufficient_funds'),
+        'timeout': TimeoutError('payment gateway timeout'),
+        'network': ConnectionError('could not reach payment gateway'),
+    }
+)
+def charge_payment(amount: Decimal, card_token: str) -> PaymentResult:
+    return gateway.charge(amount=amount, token=card_token)
+
+# Mutation that calls the external service
+def place_order(order_id: str, db: Session):
+    order = db.get(Order, order_id)
+    result = charge_payment(order.total, order.card_token)
+    if result.status == 'paid':
+        order.status = 'confirmed'
+        order.charge_id = result.charge_id
+    else:
+        order.status = 'payment_failed'
+        order.failure_reason = result.reason
+    db.commit()
+
+# Invariant that spans the external operation
+@invariant(reads=['order.status', 'order.charge_id'])
+def confirmed_orders_have_charge(db: Session):
+    """Confirmed orders must have a charge ID."""
+    bad = db.exec(
+        select(Order).where(
+            Order.status == 'confirmed',
+            Order.charge_id.is_(None)
+        )
+    ).all()
+    assert len(bad) == 0, f"Confirmed without charge: {bad}"
+```
+
+During exploration:
+
+1. When the explorer reaches `place_order`, it detects that
+   `charge_payment` is an `@external` call.
+2. For each declared outcome, it replaces the call with the mock
+   return value (or exception).
+3. Checks all invariants after each outcome.
+4. Cross-product: if the order is in 3 possible states × 4 payment
+   outcomes = 12 combinations, all explored automatically.
+
+Coverage reports include external outcome coverage:
+
+```
+charge_payment outcomes:
+  success    ✓ (5x)
+  declined   ✓ (3x)
+  timeout    ✗ NEVER TESTED
+  network    ✗ NEVER TESTED
+
+Cross coverage (order.status × charge_payment outcome):
+  pending + success     ✓
+  pending + declined    ✓
+  pending + timeout     ✗ NEVER TESTED
+  confirmed + success   ✓ (idempotency check)
+  confirmed + declined  ✗ NEVER TESTED (should this be possible?)
+```
+
+This replaces hand-written integration test scenarios with declared
+outcome domains + invariants. The developer doesn't write "test that
+timeout sets status to payment_failed" — they declare the invariant
+("confirmed orders must have a charge ID") and the outcome domain
+(success, declined, timeout, network), and the tool explores the
+combinations.
+
+Mutations that don't call external services are explored without mocking.
+The `@external` decorator is opt-in — only annotate calls where you want
+outcome-domain exploration.
+
+### 8. pytest Integration
 
 ```python
 # conftest.py
@@ -325,6 +414,7 @@ Zero hand-written test scenarios.
 stipulate/
 ├── core/
 │   ├── invariant.py       # @invariant decorator + global DB invariant model
+│   ├── external.py        # @external decorator + outcome domain mocking
 │   ├── schema.py          # SQLModel introspection → FK graph, state space
 │   ├── seed.py            # FK-aware seed data generation
 │   └── types.py           # Core types: Invariant, StateSpace, Transition
@@ -480,16 +570,18 @@ verify invariants, measure coverage, mutation-test the specs.
 
 - **Visual or UI testing** — tests backend state, not appearance
 - **Performance testing** — tests correctness, not speed
-- **External service verification** — tests YOUR handling of declared
-  outcomes, not the external service itself
+- **External service verification** — explores YOUR handling of declared
+  outcome domains (success, failure, timeout, etc.), not the external
+  service itself. Does not replay real traffic or test real endpoints
 - **Replace all tests** — regression tests from production incidents
-  still need manual invariants; integration tests with mocked external
-  services are out of scope
+  still need manual invariants; visual tests, performance tests, and
+  browser-level E2E tests are out of scope
 - **Work with untyped code** — requires SQLModel type annotations.
   No types = no state space = no exploration
-- **Infer business logic** — "NPA counts as approved" must be declared
-  by the developer or LLM. The tool verifies declared invariants, it
-  doesn't guess what they should be
+- **Infer business logic** — domain-specific rules (e.g., "cancelled
+  orders can't be refunded") must be declared by the developer or LLM.
+  The tool verifies declared invariants, it doesn't guess what they
+  should be
 
 ## Ship Gate
 
@@ -501,5 +593,7 @@ Before treating Stipulate as coherent, the repo should satisfy:
 - State transition coverage reports match expected denominators
 - Mutation testing completes in <10 seconds for the demo app
 - pytest plugin runs explore + mutate in a standard test suite
+- External outcome mocking exercises all declared outcomes for at least
+  one `@external` call in the demo app
 - Console output is clear enough that a developer unfamiliar with
   Stipulate can understand what went wrong and what to do about it
