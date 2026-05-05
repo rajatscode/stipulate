@@ -159,10 +159,10 @@ def check_win(game_id: str, db: Session):
     db.commit()
 
 def delete_game(game_id: str, db: Session):
-    db.exec(delete(Cell).where(Cell.game_id == game_id))
     game = db.get(Game, game_id)
     db.delete(game)
-    # BUG: if delete(Cell) fails partway, orphaned cells remain
+    # BUG: doesn't delete child Cells. With SQLite FK enforcement off
+    # (the default in tests), this succeeds and leaves orphaned Cells.
     db.commit()
 ```
 
@@ -287,19 +287,23 @@ type-derived values. If a model has domain constraints that type
 derivation can't satisfy, the exploration fails fast with a clear error
 telling the developer to add a seed override.
 
-### 4. Boundary Value Inference
+### 4. Boundary Value Inference (opportunistic)
 
-Read invariant function bodies via Python's `ast` module. Extract
-comparisons and derive boundary values:
+Read invariant and mutation function bodies via Python's `ast` module.
+Extract simple comparisons and derive boundary values where possible:
 
 - `cell.is_mine == True` → [True, False]
 - `game.status != 'lost'` → ['lost', 'playing', 'won', 'ready']
-- `cell.adjacent_mines == actual` → [0, 1, max_neighbors]
 
-Python's `ast` module gives us the full AST of any function body. This
-is reliable — unlike JavaScript's fn.toString() fragility. We walk the
-AST, find Compare nodes, extract comparator values, and feed them into
-the exploration strategies.
+This is opportunistic, not exhaustive. AST walking reliably extracts
+constants from simple Compare nodes, but cannot derive domain-specific
+boundaries (like "max adjacent mines is 8 on a standard grid") without
+annotations. Complex expressions, helper function calls, and computed
+comparisons are opaque to static analysis.
+
+When boundary inference works, it supplements the schema-derived
+domains with values the schema doesn't know about. When it doesn't,
+exploration falls back to schema domains + seed override values.
 
 ### 5. Exploration Engine
 
@@ -313,22 +317,33 @@ SQLite in-memory (each step = mutation call + invariant checks + state
 recording; DB I/O is the bottleneck even in-memory). Use DB savepoints
 for rollback between sequences rather than re-seeding.
 
-The `reads` dependencies for each invariant are auto-inferred from AST
-analysis of the function body (which `Model.column` references appear
-in queries). Manual override is available for complex invariants where
-inference fails. This enables incremental checking — only re-evaluate
-invariants whose dependencies were touched by the last mutation.
+By default, all invariants are re-checked after every mutation step.
+This is sound but slower. As an opt-in optimization, developers can
+declare `@invariant(reads=['game.status', 'cell.state'])` to enable
+incremental checking — only re-evaluate when those columns change.
+AST-based inference of `reads` is available as a helper but not the
+default, because it is unsound for helper functions, dynamic SQL,
+joins across relationships, and indirect dependencies.
 
 1. Create test DB + seed data from schema / overrides
 2. For each mutation sequence of length 1..N:
    a. Call mutation function with generated arguments
-   b. Check touched invariants (schema-derived + custom) against the DB
-   c. Check forbidden transitions against recorded state changes
-   d. Record state transitions (column value changes)
-   e. If violation → record, shrink, report
+   b. If the call raises a domain error (NoResultFound, ValueError,
+      IntegrityError), discard this step as an invalid input
+      combination — do not count it as a violation or coverage hit
+   c. Check all invariants (schema-derived + custom) against the DB
+   d. Check forbidden transitions against recorded state changes
+   e. Record state transitions (column value changes)
+   f. If violation → record, shrink, report
 3. Coverage-directed: bias toward uncovered transitions
 4. Adversarial: for each invariant, AST-analyze what state would
    violate it, search for mutation sequences reaching that state
+
+Expected domain errors are discarded, not reported. The explorer
+generates arguments from the seed data (valid FK references, valid
+enum values) so most calls succeed, but invalid combinations are
+inevitable and should be silently skipped. Unexpected errors (e.g.,
+AttributeError, TypeError) are reported as exploration bugs.
 
 **API mode (CI, thorough):**
 
@@ -353,8 +368,9 @@ This is the genuinely novel metric — no existing Python tool provides it.
 Transitions fall into three buckets:
 
 - **Observed** — transitions that were exercised during exploration.
-- **Expected but uncovered** — transitions between valid enum values
-  that were never exercised. These are coverage gaps.
+- **Unseen** — transitions between valid enum values that were never
+  exercised. Informational, not failures. Some may be impossible,
+  some may be gaps worth investigating. The developer decides.
 - **Forbidden** — transitions declared via `forbid_transition`. These
   are assertions: if one occurs, it's a violation, not a coverage gap.
 
@@ -364,9 +380,9 @@ Game.status transitions:
     ready → playing        ✓ (3x)
     playing → won          ✓ (1x)
     playing → lost         ✓ (2x)
-  Expected but uncovered:
-    ready → lost           ✗ (can you lose without playing?)
-    ready → won            ✗ (can you win without playing?)
+  Unseen:
+    ready → lost           (can you lose without playing?)
+    ready → won            (can you win without playing?)
   Forbidden:
     lost → won             ASSERTION (violated 1x — see check_win bug)
     lost → playing         assertion (not triggered)
@@ -377,8 +393,8 @@ Cell.state transitions:
   Observed:
     hidden → revealed      ✓ (8x)
     hidden → flagged       ✓ (2x)
-  Expected but uncovered:
-    flagged → hidden       ✗ (unflag not implemented?)
+  Unseen:
+    flagged → hidden       (unflag not implemented?)
   Forbidden:
     revealed → flagged     ASSERTION (violated 1x — flag_cell has no guard)
     revealed → hidden      assertion (not triggered)
@@ -390,9 +406,11 @@ Invariant exercise count:
 ```
 
 Forbidden transitions that fire are violations with reproducing
-sequences. Expected-but-uncovered transitions are coverage gaps with
-honest denominators. The tool never counts forbidden transitions in
-coverage percentages.
+sequences. Unseen transitions are informational — they tell the
+developer what was never exercised, but they are not failures. The
+developer can promote an unseen transition to forbidden (if it should
+never happen) or ignore it (if it's just an unexplored path). Forbidden
+transitions are excluded from coverage denominators.
 
 ### 7. Mutation Testing
 
@@ -426,27 +444,36 @@ but correct).
 
 Report:
 ```
-Mutation score: 5/6 (83%)
+Mutation score: 2/6 (33%)
 
 Killed:
   ✓ skip `game.status = 'lost'` in reveal_cell()
-    — caught by revealed_mine_means_lost
+    — caught by revealed_mine_means_lost (mine revealed, game not lost)
   ✓ swap `'lost'` → `'won'` in reveal_cell()
-    — caught by revealed_mine_means_lost
-  ✓ flip `cell.is_mine` check in reveal_cell()
-    — caught by revealed_mine_means_lost
-  ✓ skip `game.status = 'won'` in check_win()
-    — caught by: no invariant, but transition coverage drops to 0%
-      for playing→won (reported as regression)
-  ✓ skip `cell.state = 'revealed'` in reveal_cell()
-    — caught by mine_counts_accurate (cell stays hidden but game
-      proceeds as if revealed)
+    — caught by forbidden transition playing → won + revealed_mine_means_lost
 
 Survived:
+  ✗ flip `cell.is_mine` check in reveal_cell()
+    → Non-mines trigger 'lost'. No invariant catches "game lost without
+      a revealed mine." Consider: inverse invariant.
+  ✗ skip `cell.state = 'revealed'` in reveal_cell()
+    → Cell stays hidden but game proceeds. No invariant catches this.
+      Consider: "if game is lost, at least one mine is revealed."
+  ✗ skip `game.status = 'won'` in check_win()
+    → Game never transitions to 'won'. No invariant requires winning.
+      Consider: "all non-mines revealed implies game won."
   ✗ skip `cell.state = 'flagged'` in flag_cell()
-    → No invariant checks that flagging actually changes cell state.
-      Consider: an invariant or postcondition on flag_cell.
+    → Flagging does nothing. No invariant checks flag state.
+
+Your invariants catch loss-path corruption but miss win-path logic,
+flag semantics, and the inverse of revealed_mine_means_lost. The
+mutation report tells you exactly where to strengthen.
 ```
+
+A low mutation score is the honest result with two invariants. The
+value is in the feedback: each survived mutant tells you what invariant
+is missing. The developer adds invariants, re-runs, score climbs. This
+IS the product — not a high score on the first run.
 
 ### 8. External Operations and Mock Integration
 
@@ -557,7 +584,6 @@ def test_game_invariants(explorer):
     result = explorer.run()
 
     assert result.violations == []
-    assert result.transition_coverage.uncovered == []
 
 def test_mutation_score(explorer):
     result = explorer.mutate()
@@ -587,8 +613,7 @@ stipulate/
 │   ├── engine.py          # Direct-mode exploration loop
 │   ├── sequence.py        # Mutation sequence generation + shrinking
 │   ├── boundary.py        # AST boundary value inference
-│   ├── reads_inference.py # Auto-infer invariant reads from AST
-│   └── coverage.py        # State transition coverage (observed/expected/forbidden)
+│   └── coverage.py        # State transition coverage (observed/unseen/forbidden)
 ├── mutate/
 │   ├── operators.py       # AST mutation operators (skip, flip, swap)
 │   ├── runner.py          # In-process mutate + re-explore loop
@@ -606,7 +631,7 @@ stipulate/
 
 - **Hypothesis** — value generation from types + boundary values
 - **Schemathesis** — API-mode exploration via OpenAPI (CI)
-- **Python `ast`** — boundary inference, reads inference, mutation ops
+- **Python `ast`** — boundary inference (opportunistic), mutation ops
 - **pytest** — test runner integration
 
 ### What Stipulate does NOT use
@@ -633,10 +658,11 @@ Three kinds of checks:
 **Custom invariants (developer-written):**
 
 - `@invariant` decorators on functions that take a `Session`.
-- `reads` dependencies auto-inferred from AST (which `Model.column`
-  references appear in queries). Manual override available.
-- Checked after every exploration step. Only re-evaluated when touched
-  dependencies change (incremental checking for performance).
+- Checked after every exploration step by default (sound).
+- Opt-in `reads` declaration enables incremental checking (only
+  re-evaluate when declared columns change). This is a performance
+  optimization, not the default, because inference is unsound for
+  helper functions, dynamic SQL, and indirect dependencies.
 - Violations include the invariant name, the DB state, and a shrunk
   reproducing mutation sequence.
 
@@ -656,7 +682,7 @@ board and 1 mine. Two moments:
 
 1. Show the SQLModel models (Game, Cell) — standard code, nothing new.
 2. Show two `@invariant` decorators (revealed mine = lost, mine counts
-   accurate) and five `forbid_transition` declarations.
+   accurate) and six `forbid_transition` declarations.
 3. Run `stipulate explore`.
 4. Tool derives schema checks, generates seed data (3x3 board),
    explores ~200 mutation sequences in a few seconds.
@@ -672,13 +698,14 @@ VIOLATION: [forbidden] Cell.state: revealed → flagged
   flag_cell() flagged an already-revealed cell — no guard.
 
 VIOLATION: [schema] orphan_detection
-  After: delete_game('g1') [partial failure]
-  Cell(game_id='g1') references deleted Game.
+  After: delete_game('g1')
+  Cell(game_id='g1') references deleted Game. delete_game deletes the
+  parent without cleaning up child Cells (SQLite FK enforcement is off).
 
 Transition coverage (excluding forbidden):
-  Observed: 4/6  Expected but uncovered: 2/6
-    ready → lost    ✗
-    ready → won     ✗
+  Observed: 4   Unseen: 2
+    ready → lost    (unseen)
+    ready → won     (unseen)
 ```
 
 Two business logic bugs (check_win ignores loss, flag_cell has no
@@ -691,15 +718,24 @@ guard) and one structural bug, zero test scenarios.
 3. Reports:
 
 ```
-Mutation score: 5/6 (83%)
+Mutation score: 2/6 (33%)
+
+Killed:
+  ✓ skip `game.status = 'lost'` — revealed_mine_means_lost
+  ✓ swap `'lost'` → `'won'` — revealed_mine_means_lost + forbidden
 
 Survived:
-  ✗ skip `cell.state = 'flagged'` in flag_cell()
-    → No invariant verifies that flagging changes cell state.
+  ✗ flip `cell.is_mine` check — no "game lost implies mine revealed" invariant
+  ✗ skip `cell.state = 'revealed'` — no "lost game has revealed mine" invariant
+  ✗ skip `game.status = 'won'` — no win-condition invariant
+  ✗ skip `cell.state = 'flagged'` — no flag-state invariant
 ```
 
-Developer adds an invariant or postcondition. Score: 6/6. The feedback
-loop converges.
+Score is low. That's honest — two invariants don't cover much. But
+each survived mutant says exactly what's missing. Developer adds
+"lost game must have a revealed mine" and "all non-mines revealed
+implies won." Score climbs to 4/6. The tool tells you where to look;
+you decide how far to go.
 
 ## Relationship to Veriscope
 
@@ -745,15 +781,15 @@ verify invariants, measure coverage, mutation-test the specs.
    mutation.
 
 6. **Honest about speed.** Direct-mode exploration at ~200-500 steps/sec
-   with SQLite in-memory. DB I/O is the real bottleneck; use savepoints,
-   incremental invariant checking (only re-check when touched
-   dependencies change), and batch reads where possible. API mode is
-   opt-in for CI.
+   with SQLite in-memory (check-all invariants). DB I/O is the real
+   bottleneck; use savepoints and batch reads where possible. Opt-in
+   `reads` declarations enable incremental checking for further speedup.
+   API mode is opt-in for CI.
 
-7. **Three-bucket coverage.** Observed, expected-but-uncovered, and
-   forbidden. Forbidden transitions are assertions, not coverage gaps.
-   Coverage percentages never include forbidden transitions in the
-   denominator.
+7. **Three-bucket coverage.** Observed, unseen, and forbidden. Forbidden
+   transitions are assertions, not coverage gaps. Unseen transitions are
+   informational — the developer decides which matter. Forbidden
+   transitions are excluded from coverage denominators.
 
 8. **The feedback loop is the product.** Explore → find violations →
    fix code → mutate → find weak invariants → strengthen → repeat.
