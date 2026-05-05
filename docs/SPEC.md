@@ -194,9 +194,7 @@ invariants = [
     "myapp.invariants:revealed_mine_means_lost",
     "myapp.invariants:mine_counts_accurate",
 ]
-postconditions = [
-    "myapp.invariants:win_detected",
-]
+# postconditions added later via mutation feedback — see Demo Plan
 seeds = [
     "myapp.seeds:game_seed",
     "myapp.seeds:cell_seeds",
@@ -242,6 +240,7 @@ flag_action = action(
     },
     pre=lambda db, cell: db.get(Game, cell.game_id).status == 'playing',
     discard=[NoResultFound],
+    rejects=[ValueError],  # valid guard: flag_cell raises ValueError on revealed cells (after fix)
 )
 
 check_win_action = action(
@@ -510,23 +509,25 @@ joins across relationships, and indirect dependencies.
    b. **Unguarded** (30% of budget): ignore `pre`, draw any type-valid
       arguments from the DB. Probes for missing guards.
 3. Snapshot tracked column values (before state).
-4. Call the action's function with generated arguments:
+4. Create a per-step savepoint (protects against dirty ORM state from
+   failed calls).
+5. Call the action's function with generated arguments:
    a. If the call raises an exception on the action's `discard` list,
-      skip this step silently (generator artifact).
+      roll back the per-step savepoint and skip (generator artifact).
    b. If the call is **unguarded** and raises an exception on the
-      action's `rejects` list, skip silently (function correctly
-      rejected invalid input — the guard exists).
-   c. If the call raises an undeclared exception, report it as an
-      exploration finding (likely a bug or missing discard/rejects).
+      action's `rejects` list, roll back the per-step savepoint and
+      skip (function correctly rejected invalid input).
+   c. If the call raises an undeclared exception, roll back the
+      per-step savepoint and report as an exploration finding.
    d. Otherwise, the call succeeded — flush the session.
-5. Snapshot tracked column values again (after state).
-6. Diff before/after → record state transitions.
-7. Check forbidden transitions against the diff.
-8. Check all invariants (schema-derived + custom) against the DB.
-9. Check postconditions bound to the action that just ran.
-10. If violation → record, shrink, report.
-11. Coverage-directed: bias toward uncovered transitions.
-12. Adversarial: for each invariant, AST-analyze what state would
+6. Snapshot tracked column values again (after state).
+7. Diff before/after → record state transitions.
+8. Check forbidden transitions against the diff.
+9. Check all invariants (schema-derived + custom) against the DB.
+10. Check postconditions bound to the action that just ran.
+11. If violation → record, shrink, report.
+12. Coverage-directed: bias toward uncovered transitions.
+13. Adversarial: for each invariant, AST-analyze what state would
     violate it, search for mutation sequences reaching that state.
 
 **API mode (CI, thorough):**
@@ -539,10 +540,13 @@ including middleware, auth, serialization, and validation.
 2. Schemathesis generates endpoint calls with schema-aware strategies
 3. Inject valid FK references from seed data into strategies
 4. After each response, check all invariants against the DB
-5. Record state transitions
+5. Check forbidden transitions against recorded state changes
+6. Record state transitions
 
-Most exploration happens in direct mode. API mode catches HTTP-layer
-bugs that direct mode misses.
+API mode checks global invariants and forbidden transitions but does
+not run action postconditions (no endpoint-to-action mapping in v1).
+Postconditions are a direct-mode concept. Most exploration happens in
+direct mode. API mode catches HTTP-layer bugs that direct mode misses.
 
 ### 6. State Transition Coverage
 
@@ -733,14 +737,17 @@ Coverage reports include external outcome coverage:
 post_score outcomes:
   success      ✓ (5x)
   duplicate    ✓ (3x)
-  timeout      ✗ NEVER TESTED
-  unavailable  ✗ NEVER TESTED
+  timeout      ✓ (2x) — submit_score doesn't catch TimeoutError,
+                         exception propagated (exploration finding)
+  unavailable  ✓ (2x) — same: ConnectionError uncaught
 
 Cross coverage (game.status × post_score outcome):
   won + success       ✓
   won + duplicate     ✓
-  won + timeout       ✗ NEVER TESTED
-  lost + success      ✗ NEVER TESTED (should this be possible?)
+  won + timeout       ✓ (uncaught exception)
+  won + unavailable   ✓ (uncaught exception)
+  lost + success      ✓ (submit after loss — should this be possible?)
+  playing + success   ✗ UNSEEN (submit during play — no action reaches this)
 ```
 
 The `@external` decorator is opt-in. Mutations that don't call external
@@ -774,7 +781,7 @@ def explorer(test_db):
         models=[Game, Cell],
         actions=[reveal_action, flag_action, check_win_action, delete_game_action],
         invariants=[revealed_mine_means_lost, mine_counts_accurate],
-        postconditions=[win_detected],
+        postconditions=[win_detected],  # added after mutation feedback
         db=test_db,
         budget=500,
     )
@@ -972,10 +979,18 @@ Survived:
 
 50% score is honest — two business invariants catch the loss-path
 mutations but miss the win-path and flag semantics. Each survived
-mutant tells you exactly what's missing. Developer adds a postcondition
-on check_win ("if all non-mines revealed and not lost, status must be
-won"). Score climbs to 4/6. The tool tells you where to look; you
-decide how far to go.
+mutant tells you exactly what's missing.
+
+4. Developer adds `@postcondition(action=check_win_action)` for the
+   win condition and registers it in config.
+5. Re-runs `stipulate mutate`. Score: 4/6 (67%) — the win-path mutant
+   is now killed. The remaining two survivors (skip `cell.state`
+   assignments) need invariants about cell state, which the developer
+   can add or accept as low-priority.
+
+The demo phases are: start with two invariants → explore → fix bugs →
+mutate → see gaps → add postcondition → re-mutate → score climbs.
+This IS the feedback loop.
 
 ## Relationship to Veriscope
 
