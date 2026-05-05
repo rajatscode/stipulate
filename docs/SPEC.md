@@ -219,25 +219,25 @@ from stipulate import action, from_seed, from_entity
 reveal_action = action(
     fn='myapp.game:reveal_cell',  # import path, not reference (for mutation patching)
     params={
-        'game_id': from_seed(Game),
         'cell': from_entity(Cell, where=lambda c: c.state == 'hidden'),
-        # row and col projected from the same Cell record
+        # all params derived from the same Cell — no cross-game mismatch
+        'game_id': lambda cell: cell.game_id,
         'row': lambda cell: cell.row,
         'col': lambda cell: cell.col,
     },
-    pre=lambda db, game_id: db.get(Game, game_id).status == 'playing',
+    pre=lambda db, cell: db.get(Game, cell.game_id).status == 'playing',
     discard=[NoResultFound],
 )
 
 flag_action = action(
     fn='myapp.game:flag_cell',
     params={
-        'game_id': from_seed(Game),
         'cell': from_entity(Cell, where=lambda c: c.state == 'hidden'),
+        'game_id': lambda cell: cell.game_id,
         'row': lambda cell: cell.row,
         'col': lambda cell: cell.col,
     },
-    pre=lambda db, game_id: db.get(Game, game_id).status == 'playing',
+    pre=lambda db, cell: db.get(Game, cell.game_id).status == 'playing',
     discard=[NoResultFound],
 )
 
@@ -274,23 +274,31 @@ call. The explorer uses this in two modes:
   Finds bugs in legitimate sequences (like check_win overwriting a
   loss). This is the primary exploration mode.
 
-- **Unguarded exploration:** ignores `pre` and calls the function with
-  any type-valid arguments (e.g., flag_cell on a revealed cell). Finds
-  missing guards — code that SHOULD reject the call but doesn't. If an
-  unguarded call triggers a forbidden transition, that's a missing
-  guard bug.
+- **Unguarded exploration:** ignores `pre` and parameter filters,
+  draws any type-valid arguments from the DB (e.g., flag_cell on a
+  revealed cell). Probes for missing guards.
+
+Unguarded calls are NOT automatically violations. The explorer only
+reports a finding when an unguarded call causes an invariant failure or
+forbidden transition. If the function succeeds and no check fires,
+nothing is reported — many service functions legitimately rely on
+callers for validation.
 
 Both modes run during exploration. Budget split is configurable
 (default: 70% guarded, 30% unguarded). The demo's flag_cell bug
-(`revealed → flagged`) is found by unguarded exploration — the action
-model says "only flag hidden cells," so when calling without that
-filter triggers a forbidden transition, the tool reports:
+(`revealed → flagged`) is found because unguarded exploration calls
+flag_cell on a revealed cell, the function succeeds (no guard), and
+the forbidden transition `revealed → flagged` fires:
 
-> flag_cell(revealed_cell) succeeded but caused forbidden transition
-> Cell.state: revealed → flagged. Missing guard in flag_cell.
+> [unguarded] flag_cell(1, 1) on revealed cell triggered forbidden
+> transition Cell.state: revealed → flagged.
 
-This resolves the tension: the cleaner the action model, the better it
-identifies which unguarded calls reveal missing guards.
+If the function had raised ValueError (rejecting the call), the engine
+would treat it as a valid guard and skip silently.
+
+This resolves the tension: the action model declares the expected
+validity boundary; unguarded exploration probes whether the code
+actually enforces it.
 
 **Discard list:**
 
@@ -302,36 +310,35 @@ There are no generic discard rules. Each action declares its own.
 
 **Transaction semantics:**
 
-The engine uses SQLAlchemy's `connection.begin_nested()` to create a
-SAVEPOINT before each exploration sequence. The Session is bound to
-this connection. When mutation functions call `db.commit()`:
-
-- SQLAlchemy releases the inner savepoint (changes visible within the
-  connection's transaction).
-- The engine reads DB state for invariant checks.
-- After the sequence completes, the engine rolls back the outer
-  transaction, restoring the seed state.
+The engine uses SQLAlchemy 2.0's `Session(bind=conn)` with
+`join_transaction_mode="create_savepoint"`. This means when the
+mutation calls `session.commit()`, SQLAlchemy releases only the
+session-level savepoint, not the connection's outer transaction.
 
 Concretely:
 ```python
 with engine.connect() as conn:
-    with conn.begin():  # outer transaction
+    with conn.begin():  # outer transaction — never committed
         seed_database(conn)
         for sequence in generate_sequences():
-            savepoint = conn.begin_nested()
-            session = Session(bind=conn)
+            # Session commits become savepoint releases, not real commits
+            session = Session(bind=conn, join_transaction_mode="create_savepoint")
             try:
                 run_sequence(session, sequence)
+                session.flush()  # ensure pending writes are visible
                 check_invariants(session)
                 record_transitions(session)
             finally:
-                savepoint.rollback()  # restore seed state
+                session.rollback()  # rolls back to pre-sequence state
+                session.close()
 ```
 
 This means:
-- Mutation functions commit normally (flush + savepoint release).
-- Each sequence starts from clean seed state.
-- Shrinking replays from the same initial state.
+- Mutation functions call `db.commit()` normally — it releases the
+  session's savepoint but not the outer transaction.
+- After each sequence, `session.rollback()` restores seed state.
+- Invariant checks see committed-within-savepoint state.
+- Shrinking replays sequences from the same initial state.
 - No test-specific "don't commit" mode needed.
 
 ## What the Tool Does
@@ -405,19 +412,26 @@ def game_seed():
 
 @seed(Cell)
 def cell_seeds(game: Game):
-    """Generate a 3x3 grid with one mine at (0,0).
-    All non-mine cells start revealed (near-win state) so the
-    explorer can trigger check_win quickly."""
+    """Generate a 3x3 grid: mine at (0,0), one non-mine hidden at (2,2),
+    rest revealed. Near-win state — one reveal away from triggering
+    check_win. Valid under "all revealed implies won" because (2,2) is
+    still hidden."""
     cells = []
     for r in range(game.rows):
         for c in range(game.cols):
             is_mine = (r == 0 and c == 0)
-            # Chebyshev adjacency: neighbors are max(|dr|,|dc|) <= 1
+            # Chebyshev adjacency: neighbors within max(|dr|,|dc|) <= 1
             adj = 1 if (max(abs(r), abs(c)) <= 1 and not is_mine) else 0
+            # All non-mines revealed except (2,2)
+            if is_mine:
+                state = 'hidden'
+            elif (r, c) == (2, 2):
+                state = 'hidden'  # last non-mine — explorer reveals this
+            else:
+                state = 'revealed'
             cells.append(Cell(
                 game_id=game.id, row=r, col=c,
-                is_mine=is_mine,
-                state='hidden' if is_mine else 'revealed',
+                is_mine=is_mine, state=state,
                 adjacent_mines=adj,
             ))
     return cells
@@ -467,25 +481,27 @@ AST-based inference of `reads` is available as a helper but not the
 default, because it is unsound for helper functions, dynamic SQL,
 joins across relationships, and indirect dependencies.
 
-1. Create test DB + seed data from schema / overrides
+1. Create test DB + seed data from schema / overrides.
 2. For each step, pick an action and generate arguments:
    a. **Guarded** (70% of budget): respect the action's `pre` and
       parameter filters. Models valid user workflows.
    b. **Unguarded** (30% of budget): ignore `pre`, draw any type-valid
       arguments from the DB. Probes for missing guards.
-3. Call the action's function with generated arguments:
+3. Snapshot tracked column values (before state).
+4. Call the action's function with generated arguments:
    a. If the call raises an exception on the action's `discard` list,
       skip this step silently (invalid input combination).
    b. If the call raises an undeclared exception, report it as an
       exploration finding (likely a bug or missing discard).
-   c. Otherwise, the call succeeded.
-4. Check all invariants (schema-derived + custom) against the DB.
-5. Check forbidden transitions against recorded state changes.
-6. Record state transitions (column value changes).
-7. If violation → record, shrink, report.
-8. Coverage-directed: bias toward uncovered transitions.
-9. Adversarial: for each invariant, AST-analyze what state would
-   violate it, search for mutation sequences reaching that state.
+   c. Otherwise, the call succeeded — flush the session.
+5. Snapshot tracked column values again (after state).
+6. Diff before/after → record state transitions.
+7. Check forbidden transitions against the diff.
+8. Check all invariants (schema-derived + custom) against the DB.
+9. If violation → record, shrink, report.
+10. Coverage-directed: bias toward uncovered transitions.
+11. Adversarial: for each invariant, AST-analyze what state would
+    violate it, search for mutation sequences reaching that state.
 
 **API mode (CI, thorough):**
 
@@ -519,10 +535,10 @@ Transitions fall into three buckets:
 ```
 Game.status transitions:
   Observed:
-    ready → playing        ✓ (3x)
     playing → won          ✓ (1x)
     playing → lost         ✓ (2x)
   Unseen:
+    ready → playing        (no start_game action registered)
     ready → lost           (can you lose without playing?)
     ready → won            (can you win without playing?)
   Forbidden:
@@ -603,7 +619,8 @@ Survived:
       Consider: "if game is lost, at least one mine is revealed."
   ✗ skip `game.status = 'won'` in check_win()
     → Game never transitions to 'won'. No invariant requires winning.
-      Consider: "all non-mines revealed implies game won."
+      Consider: postcondition on check_win — "if all non-mines are
+      revealed and game is not lost, status must be 'won' after call."
   ✗ skip `cell.state = 'flagged'` in flag_cell()
     → Flagging does nothing. No invariant checks flag state.
 
@@ -843,9 +860,10 @@ board and 1 mine. Two moments:
 
 ```
 VIOLATION: [forbidden] Game.status: lost → won
-  After: reveal_cell(0, 0) → check_win()
-  reveal_cell hit a mine → status='lost'. Then check_win saw all
-  non-mines revealed → set status='won'. No loss-state guard.
+  After: reveal_cell(2, 2) → reveal_cell(0, 0) → check_win()
+  reveal_cell(2,2) revealed the last non-mine. reveal_cell(0,0) hit
+  the mine → status='lost'. check_win saw all non-mines revealed →
+  set status='won'. No loss-state guard.
 
 VIOLATION: [forbidden] Cell.state: revealed → flagged
   After: reveal_cell(1, 1) → flag_cell(1, 1)  [unguarded]
@@ -859,9 +877,10 @@ VIOLATION: [schema] orphan_detection
   parent without cleaning up child Cells (SQLite FK enforcement is off).
 
 Transition coverage (excluding forbidden):
-  Observed: 4   Unseen: 2
-    ready → lost    (unseen)
-    ready → won     (unseen)
+  Observed: 4   Unseen: 3
+    ready → playing  (unseen — no start_game action)
+    ready → lost     (unseen)
+    ready → won      (unseen)
 ```
 
 Two business logic bugs (check_win ignores loss, flag_cell has no
@@ -889,9 +908,10 @@ Survived:
 
 50% score is honest — two business invariants catch the loss-path
 mutations but miss the win-path and flag semantics. Each survived
-mutant tells you exactly what's missing. Developer adds "all non-mines
-revealed implies game won." Score climbs to 4/6. The tool tells you
-where to look; you decide how far to go.
+mutant tells you exactly what's missing. Developer adds a postcondition
+on check_win ("if all non-mines revealed and not lost, status must be
+won"). Score climbs to 4/6. The tool tells you where to look; you
+decide how far to go.
 
 ## Relationship to Veriscope
 
