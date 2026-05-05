@@ -290,56 +290,68 @@ Both modes run during exploration. Budget split is configurable
 flag_cell on a revealed cell, the function succeeds (no guard), and
 the forbidden transition `revealed → flagged` fires:
 
-> [unguarded] flag_cell(1, 1) on revealed cell triggered forbidden
+> [unguarded] flag_cell(2, 2) on revealed cell triggered forbidden
 > transition Cell.state: revealed → flagged.
-
-If the function had raised ValueError (rejecting the call), the engine
-would treat it as a valid guard and skip silently.
 
 This resolves the tension: the action model declares the expected
 validity boundary; unguarded exploration probes whether the code
 actually enforces it.
 
-**Discard list:**
+**Discard vs rejects:**
 
-Per-action exceptions that indicate an impossible input combination
-despite parameter binding. Silently skipped. Any exception NOT on the
-action's discard list is reported as an exploration finding.
+Each action declares two exception lists:
 
-There are no generic discard rules. Each action declares its own.
+- `discard=[NoResultFound]` — exceptions from impossible input
+  combinations despite parameter binding. Silently skipped in both
+  guarded and unguarded modes. These are generator artifacts, not
+  interesting findings.
+
+- `rejects=[ValueError, PermissionError]` — exceptions that count as
+  valid guards during unguarded exploration. If the function raises a
+  `rejects` exception when called with invalid inputs, that's the
+  function correctly enforcing its own preconditions. Silently skipped.
+
+Any exception NOT on either list is reported as an exploration finding.
+There are no generic discard/reject rules — each action declares its
+own.
 
 **Transaction semantics:**
 
-The engine uses SQLAlchemy 2.0's `Session(bind=conn)` with
-`join_transaction_mode="create_savepoint"`. This means when the
-mutation calls `session.commit()`, SQLAlchemy releases only the
-session-level savepoint, not the connection's outer transaction.
+The engine owns the transaction boundary via an explicit SAVEPOINT
+around each exploration sequence. Mutation functions call `db.commit()`
+normally within the sequence, but the engine can roll back everything
+by rolling back the savepoint.
 
-Concretely:
+Concretely, the engine intercepts `session.commit()` to replace it
+with `session.flush()` — making changes visible for invariant checks
+without releasing the engine's savepoint:
+
 ```python
 with engine.connect() as conn:
     with conn.begin():  # outer transaction — never committed
         seed_database(conn)
         for sequence in generate_sequences():
-            # Session commits become savepoint releases, not real commits
-            session = Session(bind=conn, join_transaction_mode="create_savepoint")
+            savepoint = conn.begin_nested()  # engine-owned SAVEPOINT
+            session = Session(bind=conn)
+            session.commit = session.flush  # intercept: flush, don't commit
             try:
                 run_sequence(session, sequence)
-                session.flush()  # ensure pending writes are visible
+                session.flush()
                 check_invariants(session)
                 record_transitions(session)
             finally:
-                session.rollback()  # rolls back to pre-sequence state
+                savepoint.rollback()  # unconditionally restore seed state
                 session.close()
 ```
 
 This means:
-- Mutation functions call `db.commit()` normally — it releases the
-  session's savepoint but not the outer transaction.
-- After each sequence, `session.rollback()` restores seed state.
-- Invariant checks see committed-within-savepoint state.
+- Mutation functions call `db.commit()` — intercepted as `flush()`,
+  so changes are visible to queries but the savepoint is not released.
+- `savepoint.rollback()` always restores the exact seed state,
+  regardless of how many commits the mutation made.
+- Invariant checks see flushed-but-uncommitted state.
 - Shrinking replays sequences from the same initial state.
-- No test-specific "don't commit" mode needed.
+- No test-specific session mode needed in mutation code.
 
 ## What the Tool Does
 
@@ -526,33 +538,36 @@ This is the genuinely novel metric — no existing Python tool provides it.
 Transitions fall into three buckets:
 
 - **Observed** — transitions that were exercised during exploration.
-- **Unseen** — transitions between valid enum values that were never
-  exercised. Informational, not failures. Some may be impossible,
-  some may be gaps worth investigating. The developer decides.
+- **Unseen** — all other valid enum pairs that were not observed and
+  not forbidden. The denominator is every (from, to) pair in the
+  Literal/enum domain, minus forbidden pairs. Informational, not
+  failures. Some may be impossible by business logic, some may be
+  genuine gaps. The developer decides which matter.
 - **Forbidden** — transitions declared via `forbid_transition`. These
   are assertions: if one occurs, it's a violation, not a coverage gap.
+  Excluded from the denominator entirely.
 
 ```
-Game.status transitions:
-  Observed:
+Game.status transitions (denominator: 12 pairs - 4 forbidden = 8):
+  Observed: 2/8
     playing → won          ✓ (1x)
     playing → lost         ✓ (2x)
-  Unseen:
-    ready → playing        (no start_game action registered)
-    ready → lost           (can you lose without playing?)
-    ready → won            (can you win without playing?)
+  Unseen: 6/8
+    ready → playing        ready → lost         ready → won
+    playing → ready        lost → ready         won → ready
   Forbidden:
     lost → won             ASSERTION (violated 1x — see check_win bug)
     lost → playing         assertion (not triggered)
     won → lost             assertion (not triggered)
     won → playing          assertion (not triggered)
 
-Cell.state transitions:
-  Observed:
+Cell.state transitions (denominator: 6 pairs - 2 forbidden = 4):
+  Observed: 2/4
     hidden → revealed      ✓ (8x)
     hidden → flagged       ✓ (2x)
-  Unseen:
+  Unseen: 2/4
     flagged → hidden       (unflag not implemented?)
+    flagged → revealed     (unflag then reveal?)
   Forbidden:
     revealed → flagged     ASSERTION (violated 1x — flag_cell has no guard)
     revealed → hidden      assertion (not triggered)
@@ -771,7 +786,7 @@ Zero hand-written test scenarios.
 ```
 stipulate/
 ├── core/
-│   ├── invariant.py       # @invariant decorator + DB-global invariant model
+│   ├── invariant.py       # @invariant + @postcondition decorators
 │   ├── transitions.py     # forbid_transition + three-bucket coverage model
 │   ├── external.py        # @external decorator + outcome domain mocking
 │   ├── schema.py          # SQLModel introspection → FK graph, state space
@@ -816,7 +831,7 @@ Backend invariants are different from function pre/postconditions. They
 are global state invariants that read from the database and are checked
 after each exploration step.
 
-Three kinds of checks:
+Four kinds of checks:
 
 **Schema-derived (automatic):**
 
@@ -835,6 +850,40 @@ Three kinds of checks:
   helper functions, dynamic SQL, and indirect dependencies.
 - Violations include the invariant name, the DB state, and a shrunk
   reproducing mutation sequence.
+
+**Action postconditions:**
+
+- `@postcondition(action=check_win_action)` decorators on functions
+  that take `(db: Session, **action_params)`.
+- Checked only after the bound action runs (not after every step).
+- Express properties that are true AFTER a specific action, not
+  globally. Example: "after check_win, if all non-mines are revealed
+  and game is not lost, status must be 'won'."
+- This avoids the global-invariant trap where a valid intermediate
+  state (near-win board during exploration) would fail a rule that
+  only applies after a specific operation.
+
+```python
+from stipulate import postcondition
+
+@postcondition(action=check_win_action)
+def win_detected(db: Session, game_id: str):
+    """After check_win, if all non-mines revealed and not lost, must be won."""
+    game = db.get(Game, game_id)
+    if game.status == 'lost':
+        return  # loss takes precedence
+    unrevealed = db.exec(
+        select(Cell).where(
+            Cell.game_id == game_id,
+            Cell.is_mine == False,
+            Cell.state != 'revealed'
+        )
+    ).all()
+    if len(unrevealed) == 0:
+        assert game.status == 'won', (
+            f"All non-mines revealed but status is '{game.status}'"
+        )
+```
 
 **Forbidden transitions:**
 
@@ -866,7 +915,7 @@ VIOLATION: [forbidden] Game.status: lost → won
   set status='won'. No loss-state guard.
 
 VIOLATION: [forbidden] Cell.state: revealed → flagged
-  After: reveal_cell(1, 1) → flag_cell(1, 1)  [unguarded]
+  After: [unguarded] flag_cell(2, 2)
   flag_cell() succeeded on a revealed cell — no guard.
   (Found via unguarded exploration: action model says "only flag hidden
    cells," but the function accepts any cell.)
