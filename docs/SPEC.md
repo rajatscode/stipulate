@@ -240,7 +240,7 @@ flag_action = action(
     },
     pre=lambda db, cell: db.get(Game, cell.game_id).status == 'playing',
     discard=[NoResultFound],
-    rejects=[ValueError],  # valid guard: flag_cell raises ValueError on revealed cells (after fix)
+    # rejects=[ValueError] added after fixing flag_cell — see Demo Plan
 )
 
 check_win_action = action(
@@ -328,32 +328,45 @@ Concretely, the engine intercepts `session.commit()` to replace it
 with `session.flush()` — making changes visible for invariant checks
 without releasing the engine's savepoint:
 
+Two levels of savepoints:
+
 ```python
 with engine.connect() as conn:
     with conn.begin():  # outer transaction — never committed
         seed_database(conn)
         for sequence in generate_sequences():
-            savepoint = conn.begin_nested()  # engine-owned SAVEPOINT
+            seq_sp = conn.begin_nested()  # sequence savepoint → restores seed
             session = Session(bind=conn)
-            session.commit = session.flush  # intercept: flush, don't commit
-            try:
-                run_sequence(session, sequence)
+            session.commit = session.flush  # intercept commit
+            for action_call in sequence:
+                step_sp = conn.begin_nested()  # step savepoint → protects against failed calls
+                try:
+                    result = call_action(session, action_call)
+                except DiscardOrReject:
+                    step_sp.rollback()  # undo any dirty ORM state from failed call
+                    continue
+                except Exception:
+                    step_sp.rollback()
+                    report_finding(...)
+                    continue
+                step_sp.release()  # success: keep changes, proceed to checks
                 session.flush()
-                check_invariants(session)
-                record_transitions(session)
-            finally:
-                savepoint.rollback()  # unconditionally restore seed state
-                session.close()
+                snapshot_and_check(session)
+            seq_sp.rollback()  # restore seed state for next sequence
+            session.close()
 ```
 
-This means:
-- Mutation functions call `db.commit()` — intercepted as `flush()`,
-  so changes are visible to queries but the savepoint is not released.
-- `savepoint.rollback()` always restores the exact seed state,
-  regardless of how many commits the mutation made.
-- Invariant checks see flushed-but-uncommitted state.
-- Shrinking replays sequences from the same initial state.
-- No test-specific session mode needed in mutation code.
+- **Sequence savepoint** (`seq_sp`): wraps the entire multi-step
+  sequence. Rolled back after every sequence to restore seed state.
+- **Step savepoint** (`step_sp`): wraps each individual action call.
+  Released on success (changes kept for subsequent steps and checks).
+  Rolled back on discard/reject/error (prevents dirty ORM state from
+  leaking into the sequence).
+- `session.commit = session.flush`: mutations commit normally from
+  their perspective; changes are flushed to the DB but the sequence
+  savepoint is never released.
+- Invariant checks see flushed state after each successful step.
+- Shrinking replays sequences from the same seed state.
 
 **Limitation:** commit interception means direct mode does not exercise
 real commit behavior: `after_commit` hooks, session expiration,
@@ -545,8 +558,11 @@ including middleware, auth, serialization, and validation.
 
 API mode checks global invariants and forbidden transitions but does
 not run action postconditions (no endpoint-to-action mapping in v1).
-Postconditions are a direct-mode concept. Most exploration happens in
-direct mode. API mode catches HTTP-layer bugs that direct mode misses.
+Postconditions are a direct-mode concept. The result model discloses
+this: `result.postconditions_skipped = True` in API mode, so the
+developer knows their full spec didn't run. Most exploration happens
+in direct mode. API mode catches HTTP-layer bugs that direct mode
+misses.
 
 ### 6. State Transition Coverage
 
@@ -564,6 +580,12 @@ Transitions fall into three buckets:
 - **Forbidden** — transitions declared via `forbid_transition`. These
   are assertions: if one occurs, it's a violation, not a coverage gap.
   Excluded from the denominator entirely.
+
+Developers can classify noisy unseen transitions as ignored:
+`ignore_transition(Game.status, from_='lost', to='ready')`. Ignored
+transitions are excluded from reports (neither unseen nor forbidden).
+This keeps the coverage report focused on transitions the developer
+cares about, without asserting they're impossible.
 
 ```
 Game.status transitions (denominator: 12 pairs - 4 forbidden = 8):
