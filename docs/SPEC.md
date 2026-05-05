@@ -198,6 +198,93 @@ invariants = [
 
 FastAPI route auto-discovery is a future improvement, not v1.
 
+## Action Model
+
+The biggest conceptual gap in "just fuzz your mutations" is: how does
+the explorer know which calls are valid, what arguments to pass, and
+which errors mean "bad input" vs "real bug"?
+
+Stipulate requires an explicit action model for each mutation:
+
+```python
+from stipulate import action, from_seed, from_field
+
+reveal_action = action(
+    fn=reveal_cell,
+    params={
+        'game_id': from_seed(Game),
+        'row': from_field(Cell.row, where=lambda c: c.state == 'hidden'),
+        'col': from_field(Cell.col, where=lambda c: c.state == 'hidden'),
+    },
+    pre=lambda db, game_id: db.get(Game, game_id).status == 'playing',
+    discard=[NoResultFound],  # invalid coordinates → skip, not violation
+)
+
+flag_action = action(
+    fn=flag_cell,
+    params={
+        'game_id': from_seed(Game),
+        'row': from_field(Cell.row, where=lambda c: c.state == 'hidden'),
+        'col': from_field(Cell.col, where=lambda c: c.state == 'hidden'),
+    },
+    pre=lambda db, game_id: db.get(Game, game_id).status == 'playing',
+    discard=[NoResultFound],
+)
+
+check_win_action = action(
+    fn=check_win,
+    params={'game_id': from_seed(Game)},
+    # no precondition — check_win is always callable (that's the bug)
+)
+
+delete_game_action = action(
+    fn=delete_game,
+    params={'game_id': from_seed(Game)},
+)
+```
+
+**Parameter binding:**
+
+- `from_seed(Model)` — picks an ID from seeded entities of that type.
+- `from_field(Model.col, where=...)` — picks a value that exists in the
+  DB matching the filter. Ensures generated calls reference real state.
+- `from_values([...])` — explicit value list for non-schema params.
+
+**Preconditions (`pre`):**
+
+A function that checks whether the call is valid given current DB state.
+If `pre` returns False, the explorer skips this action for this step.
+This prevents wasting exploration budget on calls that will trivially
+fail (e.g., revealing on an already-lost game).
+
+Preconditions are NOT invariants — they don't assert correctness, they
+filter invalid inputs. A mutation that should be guarded but isn't
+(like check_win not checking game.status) is a bug that the tool finds
+when a forbidden transition fires.
+
+**Discard list:**
+
+Exceptions that indicate an invalid input combination was generated
+despite parameter binding and preconditions. These are silently
+skipped. Any exception NOT on the discard list is reported as an
+exploration error (likely a bug in the mutation or the action model).
+
+**Transaction semantics:**
+
+The exploration engine provides a Session wrapped in a SAVEPOINT. When
+mutation functions call `db.commit()`, the commit is real within the
+savepoint scope. After checking invariants and recording transitions,
+the engine rolls back to the savepoint before the next sequence. This
+means:
+
+- Mutation functions don't need modification — they commit normally.
+- Each exploration sequence starts from a clean seed state.
+- Shrinking replays sequences from the same initial state.
+- No test-specific "don't commit" mode is needed.
+
+This is the same pattern as Django's `TestCase` (wrapped transactions)
+and pytest-django's `transaction=True` mode.
+
 ## What the Tool Does
 
 ### 1. Schema Introspection
@@ -269,14 +356,20 @@ def game_seed():
 
 @seed(Cell)
 def cell_seeds(game: Game):
-    """Generate a 3x3 grid with one mine at (0,0)."""
+    """Generate a 3x3 grid with one mine at (0,0).
+    All non-mine cells start revealed (near-win state) so the
+    explorer can trigger check_win quickly."""
     cells = []
     for r in range(game.rows):
         for c in range(game.cols):
+            is_mine = (r == 0 and c == 0)
+            # Chebyshev adjacency: neighbors are max(|dr|,|dc|) <= 1
+            adj = 1 if (max(abs(r), abs(c)) <= 1 and not is_mine) else 0
             cells.append(Cell(
                 game_id=game.id, row=r, col=c,
-                is_mine=(r == 0 and c == 0),
-                adjacent_mines=1 if abs(r) + abs(c) <= 2 and not (r == 0 and c == 0) else 0,
+                is_mine=is_mine,
+                state='hidden' if is_mine else 'revealed',
+                adjacent_mines=adj,
             ))
     return cells
 ```
@@ -444,18 +537,18 @@ but correct).
 
 Report:
 ```
-Mutation score: 2/6 (33%)
+Mutation score: 3/6 (50%)
 
 Killed:
   ✓ skip `game.status = 'lost'` in reveal_cell()
     — caught by revealed_mine_means_lost (mine revealed, game not lost)
   ✓ swap `'lost'` → `'won'` in reveal_cell()
-    — caught by forbidden transition playing → won + revealed_mine_means_lost
+    — caught by revealed_mine_means_lost (mine revealed, game is 'won')
+  ✓ flip `cell.is_mine` check in reveal_cell()
+    — caught by revealed_mine_means_lost (actual mine revealed via
+      normal path, but game never set to 'lost' because check flipped)
 
 Survived:
-  ✗ flip `cell.is_mine` check in reveal_cell()
-    → Non-mines trigger 'lost'. No invariant catches "game lost without
-      a revealed mine." Consider: inverse invariant.
   ✗ skip `cell.state = 'revealed'` in reveal_cell()
     → Cell stays hidden but game proceeds. No invariant catches this.
       Consider: "if game is lost, at least one mine is revealed."
@@ -526,9 +619,15 @@ During exploration:
 1. When the explorer reaches `submit_score`, it detects that
    `post_score` is an `@external` call.
 2. For each declared outcome, it replaces the call with the mock
-   return value (or exception).
-3. Checks all invariants after each outcome.
-4. Cross-product: if the game is in 4 possible states × 4 leaderboard
+   return value (or raises the mock exception).
+3. If the mutation doesn't catch a declared exception (e.g., timeout
+   propagates out of submit_score), that is a valid exploration path —
+   the mutation "failed." The engine treats this like any other
+   exception: if it's on the action's discard list, skip; otherwise
+   check invariants against the DB state at the point of failure.
+   Uncaught external exceptions often reveal missing error handling.
+4. Checks all invariants after each outcome.
+5. Cross-product: if the game is in 4 possible states × 4 leaderboard
    outcomes = 16 combinations, all explored automatically.
 
 Coverage reports include external outcome coverage:
@@ -690,8 +789,9 @@ board and 1 mine. Two moments:
 
 ```
 VIOLATION: [forbidden] Game.status: lost → won
-  After: reveal_cell(0, 0) [mine] → check_win()
-  check_win() set status to 'won' despite game already being 'lost'.
+  After: reveal_cell(0, 0) → check_win()
+  reveal_cell hit a mine → status='lost'. Then check_win saw all
+  non-mines revealed → set status='won'. No loss-state guard.
 
 VIOLATION: [forbidden] Cell.state: revealed → flagged
   After: reveal_cell(1, 1) → flag_cell(1, 1)
@@ -718,24 +818,24 @@ guard) and one structural bug, zero test scenarios.
 3. Reports:
 
 ```
-Mutation score: 2/6 (33%)
+Mutation score: 3/6 (50%)
 
 Killed:
   ✓ skip `game.status = 'lost'` — revealed_mine_means_lost
-  ✓ swap `'lost'` → `'won'` — revealed_mine_means_lost + forbidden
+  ✓ swap `'lost'` → `'won'` — revealed_mine_means_lost
+  ✓ flip `cell.is_mine` check — revealed_mine_means_lost
 
 Survived:
-  ✗ flip `cell.is_mine` check — no "game lost implies mine revealed" invariant
-  ✗ skip `cell.state = 'revealed'` — no "lost game has revealed mine" invariant
+  ✗ skip `cell.state = 'revealed'` — no invariant requires revealed state
   ✗ skip `game.status = 'won'` — no win-condition invariant
   ✗ skip `cell.state = 'flagged'` — no flag-state invariant
 ```
 
-Score is low. That's honest — two invariants don't cover much. But
-each survived mutant says exactly what's missing. Developer adds
-"lost game must have a revealed mine" and "all non-mines revealed
-implies won." Score climbs to 4/6. The tool tells you where to look;
-you decide how far to go.
+50% score is honest — two business invariants catch the loss-path
+mutations but miss the win-path and flag semantics. Each survived
+mutant tells you exactly what's missing. Developer adds "all non-mines
+revealed implies game won." Score climbs to 4/6. The tool tells you
+where to look; you decide how far to go.
 
 ## Relationship to Veriscope
 
@@ -750,7 +850,7 @@ verify invariants, measure coverage, mutation-test the specs.
 | Dependency graph | Signal → derived → effect | Mutation → field writes → invariant reads |
 | Assertions | assertAlways, assertAfter | @invariant, forbid_transition |
 | Exploration | Backward cone enumeration | Mutation sequence generation |
-| Coverage | Toggle, transition, cross | Observed / expected / forbidden |
+| Coverage | Toggle, transition, cross | Observed / unseen / forbidden |
 | Mutation testing | Graph mutations (sever, negate) | Code mutations (skip, flip, swap) |
 | Free baseline | None (requires signal registration) | Schema-derived checks |
 | Speed | ~1000 states/sec (in-memory graph) | ~200-500 states/sec (SQLite in-memory) |
@@ -839,7 +939,7 @@ Before treating Stipulate as coherent, the repo should satisfy:
 - `stipulate explore` with schema checks finds the orphan/FK bug
 - `stipulate mutate` reports survived mutants with actionable suggestions
 - Seed overrides produce a valid 3x3 Minesweeper board
-- Transition coverage uses three-bucket model (observed / expected /
+- Transition coverage uses three-bucket model (observed / unseen /
   forbidden) with correct denominators
 - Forbidden transition violations include reproducing sequences
 - External outcome mocking exercises all declared outcomes for at least
