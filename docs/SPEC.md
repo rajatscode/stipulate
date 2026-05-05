@@ -29,9 +29,9 @@ bug-revealing tests because they filter out tests that fail (arXiv
 2412.14137). They validate bugs rather than catching them.
 
 Invariant-based verification doesn't have this problem. When you write
-`@invariant: assigned rep must exist`, that's a spec about the world, not
-about the current code. If the code violates it, that's a bug, not a bad
-test. The oracle is external to the implementation.
+`@invariant: mine counts must match adjacent mines`, that's a spec about
+the world, not about the current code. If the code violates it, that's a
+bug, not a bad test. The oracle is external to the implementation.
 
 ## Thesis
 
@@ -54,35 +54,40 @@ below.
 from stipulate import invariant
 
 # Models — unchanged SQLModel definitions
-class Facility(SQLModel, table=True):
+class Game(SQLModel, table=True):
     id: str = Field(default_factory=uuid4_str, primary_key=True)
-    name: str
-    status: Literal['active', 'suspended', 'closed'] = 'active'
-    assigned_rep_id: str | None = Field(default=None, foreign_key="rep.id")
-    priority: Literal['high', 'medium', 'low', 'none'] = 'none'
+    status: Literal['ready', 'playing', 'won', 'lost'] = 'ready'
+    rows: int = 9
+    cols: int = 9
+    mine_count: int = 10
 
-class Rep(SQLModel, table=True):
+class Cell(SQLModel, table=True):
     id: str = Field(default_factory=uuid4_str, primary_key=True)
-    name: str
-    active: bool = True
+    game_id: str = Field(foreign_key="game.id")
+    row: int
+    col: int
+    is_mine: bool = False
+    state: Literal['hidden', 'revealed', 'flagged'] = 'hidden'
+    adjacent_mines: int = 0
 
 # Invariants — the new part (optional — schema invariants work without these)
-@invariant(reads=['facility.status', 'facility.assigned_rep_id'])
-def no_rep_when_suspended(db: Session):
-    """Suspended facilities must not have assigned reps."""
+@invariant(reads=['cell.state', 'cell.is_mine', 'game.status'])
+def revealed_mine_means_lost(db: Session):
+    """If any mine is revealed, the game must be lost."""
     bad = db.exec(
-        select(Facility).where(
-            Facility.status == 'suspended',
-            Facility.assigned_rep_id.isnot(None)
+        select(Cell).join(Game).where(
+            Cell.is_mine == True,
+            Cell.state == 'revealed',
+            Game.status != 'lost'
         )
     ).all()
-    assert len(bad) == 0, f"Suspended with rep: {bad}"
+    assert len(bad) == 0, f"Revealed mines in non-lost game: {bad}"
 
-@invariant(reads=['facility.status'])
-def closed_is_terminal(db: Session):
-    """Closed facilities cannot be reopened."""
-    # Checked temporally: if status was 'closed' in any prior step,
-    # it must still be 'closed' now.
+@invariant(reads=['game.status'])
+def lost_is_terminal(db: Session):
+    """Lost games cannot transition to any other state."""
+    # Checked temporally: if status was 'lost' in any prior step,
+    # it must still be 'lost' now.
     pass  # Temporal invariants use a different decorator — see below
 ```
 
@@ -91,21 +96,41 @@ def closed_is_terminal(db: Session):
 # Stipulate discovers these from your FastAPI routes or from
 # explicit registration.
 
-def assign_rep(facility_id: str, rep_id: str, db: Session):
-    facility = db.get(Facility, facility_id)
-    facility.assigned_rep_id = rep_id
+def reveal_cell(game_id: str, row: int, col: int, db: Session):
+    game = db.get(Game, game_id)
+    cell = db.exec(
+        select(Cell).where(
+            Cell.game_id == game_id,
+            Cell.row == row, Cell.col == col
+        )
+    ).one()
+    cell.state = 'revealed'
+    if cell.is_mine:
+        game.status = 'lost'
     db.commit()
 
-def suspend(facility_id: str, db: Session):
-    facility = db.get(Facility, facility_id)
-    facility.status = 'suspended'
-    facility.assigned_rep_id = None
+def flag_cell(game_id: str, row: int, col: int, db: Session):
+    cell = db.exec(
+        select(Cell).where(
+            Cell.game_id == game_id,
+            Cell.row == row, Cell.col == col
+        )
+    ).one()
+    cell.state = 'flagged'
     db.commit()
 
-def reactivate(facility_id: str, db: Session):
-    facility = db.get(Facility, facility_id)
-    facility.status = 'active'
-    # BUG: doesn't clear assigned_rep_id from before suspension
+def check_win(game_id: str, db: Session):
+    game = db.get(Game, game_id)
+    unrevealed = db.exec(
+        select(Cell).where(
+            Cell.game_id == game_id,
+            Cell.is_mine == False,
+            Cell.state != 'revealed'
+        )
+    ).all()
+    if len(unrevealed) == 0:
+        game.status = 'won'
+    # BUG: doesn't check if game is already lost
     db.commit()
 ```
 
@@ -124,13 +149,14 @@ def reactivate(facility_id: str, db: Session):
 
 Read SQLModel table definitions. Extract:
 
-- **Bounded fields** — `Literal['active', 'suspended', 'closed']`, `bool`,
-  enum columns → finite state spaces with known domains
-- **FK relationships** — `Field(foreign_key="rep.id")` → abstract states:
-  None, valid reference, dangling reference
+- **Bounded fields** — `Literal['ready', 'playing', 'won', 'lost']`,
+  `bool`, enum columns → finite state spaces with known domains
+- **FK relationships** — `Field(foreign_key="game.id")` → abstract
+  states: None, valid reference, dangling reference
 - **Nullable fields** — `str | None` → domain includes None
 - **Pydantic validators** — constraints on valid inputs
-- **FK dependency graph** — which tables depend on which, for seed ordering
+- **FK dependency graph** — which tables depend on which, for seed
+  ordering
 
 The schema IS the state space declaration. No extra annotations needed
 for the common case.
@@ -144,7 +170,7 @@ that follow logically from the type definitions themselves:
 - **FK integrity** — every non-null FK column points to a row that exists
   in the referenced table. Derived from `Field(foreign_key=...)`.
 - **Enum validity** — Literal/enum columns only contain declared values.
-  Derived from `Literal['active', 'suspended', 'closed']`.
+  Derived from `Literal['ready', 'playing', 'won', 'lost']`.
 - **Non-null enforcement** — required (non-Optional) fields are never
   null after a mutation completes. Derived from type annotations.
 - **Orphan detection** — deleting a parent entity leaves no dangling FK
@@ -155,14 +181,14 @@ is:
 
 ```
 $ stipulate explore
-Found 2 models, 4 mutations, 0 user invariants.
-Derived 4 schema invariants: FK integrity (2), enum validity (1),
+Found 2 models, 3 mutations, 0 user invariants.
+Derived 4 schema invariants: FK integrity (1), enum validity (2),
 orphan detection (1).
 
-VIOLATION: fk_integrity — delete_rep('r1') leaves Facility(id='f1',
-assigned_rep_id='r1') referencing a deleted Rep.
+VIOLATION: fk_integrity — delete_game('g1') leaves Cell(id='c1',
+game_id='g1') referencing a deleted Game.
 
-Transition coverage: 8/14 (57%)
+Transition coverage: 6/12 (50%)
 ```
 
 No decorators. No configuration. The developer sees value from the
@@ -178,8 +204,8 @@ valid seed data automatically.
 Required behavior:
 
 - read FK graph from SQLModel metadata;
-- topological sort: create Rep before Facility (because Facility has FK
-  to Rep);
+- topological sort: create Game before Cell (because Cell has FK to
+  Game);
 - generate valid field values from column types and constraints;
 - handle unique constraints without collision;
 - support bounded fields: enumerate Literal values, bool values;
@@ -190,18 +216,18 @@ Required behavior:
 
 The seed data generator is not a factory library. It reads the schema
 and produces the minimal set of entities needed for exploration to have
-something to work with. For a Facility with FK to Rep, that's one Rep
-and one Facility.
+something to work with. For a Cell with FK to Game, that's one Game
+and a grid of Cells.
 
 ### 4. Boundary Value Inference
 
 Read invariant function bodies via Python's `ast` module. Extract
 comparisons and derive boundary values:
 
-- `balance > Decimal('10000')` → [9999.99, 10000, 10000.01]
-- `len(items) >= 3` → [2, 3, 4]
-- `status != 'closed'` → ['closed', 'active']
-- `assigned_rep_id is not None` → [None, <valid FK>]
+- `len(unrevealed) == 0` → [0, 1]
+- `cell.is_mine == True` → [True, False]
+- `game.status != 'lost'` → ['lost', 'playing']
+- `cell.adjacent_mines > 0` → [0, 1]
 
 Python's `ast` module gives us the full AST of any function body. This
 is reliable — unlike JavaScript's fn.toString() fragility. We walk the
@@ -251,25 +277,26 @@ After exploration, report which column-level transitions were exercised.
 This is the genuinely novel metric — no existing Python tool provides it.
 
 ```
-Facility.status transitions:
-  active → suspended      ✓ (3x)
-  active → closed          ✓ (1x)
-  suspended → active       ✓ (2x)
-  suspended → closed       ✗ NEVER TESTED
-  closed → active          ✗ NEVER TESTED  (should be impossible)
-  closed → suspended       ✗ NEVER TESTED  (should be impossible)
+Game.status transitions:
+  ready → playing        ✓ (3x)
+  playing → won          ✓ (1x)
+  playing → lost         ✓ (2x)
+  lost → won             ✗ NEVER TESTED  (should be impossible)
+  won → lost             ✗ NEVER TESTED  (should be impossible)
+  lost → playing         ✗ NEVER TESTED  (should be impossible)
 
-Facility.assigned_rep_id transitions:
-  None → valid_ref         ✓ (2x)
-  valid_ref → None         ✓ (1x)
-  valid_ref → different    ✗ NEVER TESTED
-  valid_ref → dangling     ✗ NEVER TESTED
+Cell.state transitions:
+  hidden → revealed      ✓ (8x)
+  hidden → flagged       ✓ (2x)
+  flagged → hidden       ✗ NEVER TESTED
+  revealed → flagged     ✗ NEVER TESTED  (should be impossible)
+  flagged → revealed     ✗ NEVER TESTED
 
 Invariant exercise count:
-  [schema] fk_integrity        6 scenarios, 0 violations
-  [schema] orphan_detection    2 scenarios, 1 VIOLATION
-  [custom] no_rep_when_suspended  2 scenarios, 1 VIOLATION
-  [custom] closed_is_terminal    0 scenarios  ← NEVER TRIGGERED
+  [schema] fk_integrity            4 scenarios, 0 violations
+  [schema] orphan_detection        2 scenarios, 1 VIOLATION
+  [custom] revealed_mine_means_lost  3 scenarios, 1 VIOLATION
+  [custom] lost_is_terminal          0 scenarios  ← NEVER TRIGGERED
 ```
 
 The denominator for each field comes from the declared domain (Literal
@@ -282,16 +309,16 @@ In-process AST transformation — no file I/O, no process restart.
 
 ```python
 # Original
-facility.assigned_rep_id = None
+game.status = 'lost'
 
 # Mutant: skip assignment
 # (AST: remove the Assign node)
 
 # Mutant: swap value
-facility.assigned_rep_id = rep_id  # instead of None
+game.status = 'won'  # instead of 'lost'
 
 # Mutant: flip comparison
-if facility.status != 'closed':  →  if facility.status == 'closed':
+if cell.is_mine:  →  if not cell.is_mine:
 ```
 
 For each mutant:
@@ -310,23 +337,23 @@ Report:
 Mutation score: 4/5 (80%)
 
 Killed:
-  ✓ skip `facility.status = 'suspended'` in suspend() — caught by no_rep_when_suspended
-  ✓ skip `facility.assigned_rep_id = None` in suspend() — caught by no_rep_when_suspended
-  ✓ flip `status != 'closed'` in suspend() — caught by closed_is_terminal
-  ✓ skip `facility.assigned_rep_id = rep_id` in assign() — caught by fk_integrity (schema)
+  ✓ skip `game.status = 'lost'` in reveal_cell() — caught by revealed_mine_means_lost
+  ✓ swap `'lost'` → `'won'` in reveal_cell() — caught by revealed_mine_means_lost
+  ✓ flip `cell.is_mine` in reveal_cell() — caught by revealed_mine_means_lost
+  ✓ skip `cell.state = 'revealed'` in reveal_cell() — caught by fk_integrity (schema)
 
 Survived:
-  ✗ skip `db.commit()` in assign() — NO INVARIANT DETECTED THIS
-    → Suggestion: your invariants check DB state but don't verify
-      the write actually persisted. Consider a temporal invariant.
+  ✗ skip win-check in check_win() — NO INVARIANT DETECTED THIS
+    → Suggestion: no invariant verifies that fully-revealed non-mine
+      boards transition to 'won'. Consider a win-condition invariant.
 ```
 
 ### 8. External Operations and Mock Integration
 
 Mutations that call external services (payment processors, email APIs,
 third-party data providers) are where integration tests live today.
-Developers hand-write scenarios: "mock the payment API to return
-declined, call place_order, assert order status is payment_failed."
+Developers hand-write scenarios: "mock the leaderboard API to return
+timeout, call submit_score, assert game state is unchanged."
 
 Stipulate replaces the scenario-writing with declared outcome domains.
 The developer declares what outcomes an external call can produce.
@@ -338,73 +365,69 @@ from stipulate import external
 
 @external(
     outcomes={
-        'success': PaymentResult(status='paid', charge_id='ch_xxx'),
-        'declined': PaymentResult(status='declined', reason='insufficient_funds'),
-        'timeout': TimeoutError('payment gateway timeout'),
-        'network': ConnectionError('could not reach payment gateway'),
+        'success': LeaderboardResult(posted=True, rank=42),
+        'duplicate': LeaderboardResult(posted=False, reason='already_submitted'),
+        'timeout': TimeoutError('leaderboard service timeout'),
+        'unavailable': ConnectionError('leaderboard service down'),
     }
 )
-def charge_payment(amount: Decimal, card_token: str) -> PaymentResult:
-    return gateway.charge(amount=amount, token=card_token)
+def post_score(game_id: str, score: int) -> LeaderboardResult:
+    return leaderboard_api.submit(game_id=game_id, score=score)
 
 # Mutation that calls the external service
-def place_order(order_id: str, db: Session):
-    order = db.get(Order, order_id)
-    result = charge_payment(order.total, order.card_token)
-    if result.status == 'paid':
-        order.status = 'confirmed'
-        order.charge_id = result.charge_id
-    else:
-        order.status = 'payment_failed'
-        order.failure_reason = result.reason
+def submit_score(game_id: str, db: Session):
+    game = db.get(Game, game_id)
+    result = post_score(game_id, game.score)
+    if result.posted:
+        game.score_submitted = True
+        game.leaderboard_rank = result.rank
     db.commit()
 
 # Invariant that spans the external operation
-@invariant(reads=['order.status', 'order.charge_id'])
-def confirmed_orders_have_charge(db: Session):
-    """Confirmed orders must have a charge ID."""
+@invariant(reads=['game.score_submitted', 'game.leaderboard_rank'])
+def submitted_scores_have_rank(db: Session):
+    """Games with submitted scores must have a leaderboard rank."""
     bad = db.exec(
-        select(Order).where(
-            Order.status == 'confirmed',
-            Order.charge_id.is_(None)
+        select(Game).where(
+            Game.score_submitted == True,
+            Game.leaderboard_rank.is_(None)
         )
     ).all()
-    assert len(bad) == 0, f"Confirmed without charge: {bad}"
+    assert len(bad) == 0, f"Submitted without rank: {bad}"
 ```
 
 During exploration:
 
-1. When the explorer reaches `place_order`, it detects that
-   `charge_payment` is an `@external` call.
+1. When the explorer reaches `submit_score`, it detects that
+   `post_score` is an `@external` call.
 2. For each declared outcome, it replaces the call with the mock
    return value (or exception).
 3. Checks all invariants after each outcome.
-4. Cross-product: if the order is in 3 possible states × 4 payment
-   outcomes = 12 combinations, all explored automatically.
+4. Cross-product: if the game is in 4 possible states × 4 leaderboard
+   outcomes = 16 combinations, all explored automatically.
 
 Coverage reports include external outcome coverage:
 
 ```
-charge_payment outcomes:
-  success    ✓ (5x)
-  declined   ✓ (3x)
-  timeout    ✗ NEVER TESTED
-  network    ✗ NEVER TESTED
+post_score outcomes:
+  success      ✓ (5x)
+  duplicate    ✓ (3x)
+  timeout      ✗ NEVER TESTED
+  unavailable  ✗ NEVER TESTED
 
-Cross coverage (order.status × charge_payment outcome):
-  pending + success     ✓
-  pending + declined    ✓
-  pending + timeout     ✗ NEVER TESTED
-  confirmed + success   ✓ (idempotency check)
-  confirmed + declined  ✗ NEVER TESTED (should this be possible?)
+Cross coverage (game.status × post_score outcome):
+  won + success       ✓
+  won + duplicate     ✓
+  won + timeout       ✗ NEVER TESTED
+  lost + success      ✗ NEVER TESTED (should this be possible?)
+  playing + success   ✗ NEVER TESTED (should this be possible?)
 ```
 
 This replaces hand-written integration test scenarios with declared
 outcome domains + invariants. The developer doesn't write "test that
-timeout sets status to payment_failed" — they declare the invariant
-("confirmed orders must have a charge ID") and the outcome domain
-(success, declined, timeout, network), and the tool explores the
-combinations.
+timeout leaves score_submitted false" — they declare the invariant
+("submitted scores must have a rank") and the outcome domain (success,
+duplicate, timeout, unavailable), and the tool explores the combinations.
 
 Mutations that don't call external services are explored without mocking.
 The `@external` decorator is opt-in — only annotate calls where you want
@@ -417,15 +440,14 @@ gaps between the codebase and the invariant suite.
 
 On each run, report:
 
-- **New enum values** — "Literal value `'archived'` added to
-  Facility.status. No transitions to/from `'archived'` have been
-  tested."
-- **Uncovered mutations** — "Mutation function `archive_facility` is
-  registered but not reached by any invariant's dependency graph."
-- **Broken invariant references** — "Invariant `no_rep_when_suspended`
-  reads `facility.assigned_rep_id`, which no longer exists (renamed to
-  `facility.rep_id`)."
-- **New FK relationships** — "New FK `Facility.branch_id → Branch.id`
+- **New enum values** — "Literal value `'paused'` added to Game.status.
+  No transitions to/from `'paused'` have been tested."
+- **Uncovered mutations** — "Mutation function `reset_game` is registered
+  but not reached by any invariant's dependency graph."
+- **Broken invariant references** — "Invariant `revealed_mine_means_lost`
+  reads `cell.state`, which no longer exists (renamed to
+  `cell.display_state`)."
+- **New FK relationships** — "New FK `Game.player_id → Player.id`
   detected. Schema-derived FK integrity and orphan checks added
   automatically."
 
@@ -442,15 +464,15 @@ from stipulate.pytest import create_explorer
 @pytest.fixture
 def explorer(test_db):
     return create_explorer(
-        models=[Facility, Rep],
-        mutations=[assign_rep, suspend, reactivate, close],
-        invariants=[no_rep_when_suspended],  # schema invariants added automatically
+        models=[Game, Cell],
+        mutations=[reveal_cell, flag_cell, check_win],
+        invariants=[revealed_mine_means_lost],  # schema invariants added automatically
         db=test_db,
         budget=500,
     )
 
 # test_contracts.py
-def test_facility_invariants(explorer):
+def test_game_invariants(explorer):
     result = explorer.run()
 
     assert result.violations == []
@@ -534,19 +556,19 @@ Two kinds of invariants:
 - Checked after every exploration step alongside schema invariants.
 - Violations include the invariant name, the DB state, and the
   reproducing mutation sequence.
-- Temporal invariants (e.g., "closed is terminal") track state across
+- Temporal invariants (e.g., "lost is terminal") track state across
   steps and check that forbidden transitions never occur.
 
 ## Demo Plan
 
-The demo uses a simplified facility management API (3 models, 4
-mutations, 1 external call) and shows two moments:
+The demo uses a Minesweeper API (2 models, 3 mutations, 1 external
+call) and shows two moments:
 
 ### Wow 1: "Zero config, found a real bug"
 
-1. Show the SQLModel models (Facility, Rep) — standard code, nothing new.
-2. Show one `@invariant` decorator (business logic: suspended facilities
-   can't have reps). Point out there's no FK integrity invariant written
+1. Show the SQLModel models (Game, Cell) — standard code, nothing new.
+2. Show one `@invariant` decorator (business logic: revealed mine means
+   game is lost). Point out there's no FK integrity invariant written
    — the tool derives that from the schema.
 3. Run `stipulate explore`.
 4. Tool reads schema, derives 4 schema invariants, generates seed data,
@@ -554,31 +576,31 @@ mutations, 1 external call) and shows two moments:
 5. Reports two violations:
 
 ```
-VIOLATION: [schema] fk_integrity
-  After: assign_rep('f1', 'r1') → delete_rep('r1')
-  Facility(id='f1', assigned_rep_id='r1') references deleted Rep.
+VIOLATION: [schema] orphan_detection
+  After: delete_game('g1')
+  Cell(id='c1', game_id='g1') references a deleted Game.
 
-VIOLATION: [custom] no_rep_when_suspended
-  After: assign_rep('f1', 'r1') → suspend('f1') → reactivate('f1')
-  Facility(id='f1', status='active', assigned_rep_id='r1')
-  ↑ reactivate() set status back to 'active' but didn't clear
-    assigned_rep_id.
+VIOLATION: [custom] revealed_mine_means_lost
+  After: reveal_cell(mine) → check_win()
+  Game status changed to 'won' despite a revealed mine.
+  ↑ check_win() doesn't verify the game isn't already lost — it only
+    checks if all non-mine cells are revealed.
 
-Transition coverage: 8/14 (57%)
+Transition coverage: 6/12 (50%)
 Drift: 0 issues
 ```
 
 The developer wrote one invariant and got a schema bug for free. The
-tool found a 3-step state transition bug AND a FK integrity bug without
-a single test scenario.
+tool found a game logic bug (check_win ignores loss state) AND an
+orphan bug without a single test scenario.
 
 ### Wow 2: "Mutation testing + external ops in one pass"
 
 1. Fix both bugs.
-2. Add an `@external` payment call with 4 declared outcomes.
-3. Add one invariant: confirmed orders must have a charge ID.
-4. Run `stipulate explore` — finds that the timeout path doesn't set
-   `failure_reason`, leaving it null.
+2. Add an `@external` leaderboard call with 4 declared outcomes.
+3. Add one invariant: submitted scores must have a rank.
+4. Run `stipulate explore` — finds that the timeout path doesn't guard
+   against setting `score_submitted = True`.
 5. Fix it. Run `stipulate mutate`.
 6. Reports:
 
@@ -586,19 +608,23 @@ a single test scenario.
 Mutation score: 7/9 (78%)
 
 Survived:
-  ✗ Removed `order.failure_reason = result.reason` from place_order()
-    → No invariant checks that failed orders record a reason.
+  ✗ Removed `game.leaderboard_rank = result.rank` from submit_score()
+    → No invariant checks that rank is set when score is submitted.
+    (Wait — submitted_scores_have_rank should catch this. Investigating...
+     The mutant was explored only in game states where submit wasn't
+     reached. Increase budget or add a precondition.)
 
-  ✗ Swapped 'timeout' and 'network' outcomes in charge_payment
-    → No invariant distinguishes timeout from network error.
+  ✗ Swapped 'timeout' and 'unavailable' outcomes in post_score
+    → No invariant distinguishes timeout from service unavailable.
 
 External outcome coverage:
-  success ✓  declined ✓  timeout ✓  network ✓
+  success ✓  duplicate ✓  timeout ✓  unavailable ✓
 ```
 
-The developer sees: invariants cover the happy path and the basic failure
-path, but don't distinguish timeout from network error. They decide
-whether that matters. The tool asks the question; the developer answers.
+The developer sees: invariants cover the core game logic and the happy
+leaderboard path, but don't distinguish timeout from unavailable. They
+decide whether that matters. The tool asks the question; the developer
+answers.
 
 ## Relationship to Veriscope
 
@@ -674,13 +700,14 @@ developer to declare them. A natural extension:
 
 ```
 $ stipulate suggest
-Analyzing 4 mutation functions and 2 models...
+Analyzing 3 mutation functions and 2 models...
 
 Suggested invariants:
-  1. suspend() sets assigned_rep_id to None — but reactivate() doesn't.
-     Suggest: "reactivated facilities should have no assigned rep"?  [y/n]
-  2. close() has no guard — can close an already-closed facility.
-     Suggest: "closed is a terminal state"?  [y/n]
+  1. reveal_cell() sets game.status='lost' when is_mine — but check_win()
+     doesn't guard against it. Suggest: "won games have no revealed
+     mines"?  [y/n]
+  2. flag_cell() has no guard — can flag an already-revealed cell.
+     Suggest: "revealed cells cannot be flagged"?  [y/n]
 ```
 
 This is not a v1 requirement. But it's the strategic path to making
@@ -693,10 +720,10 @@ verifies.
 
 Before treating Stipulate as coherent, the repo should satisfy:
 
-- `stipulate explore` with zero custom invariants finds the FK integrity
+- `stipulate explore` with zero custom invariants finds the FK/orphan
   bug via schema-derived checks
-- `stipulate explore` with one custom invariant finds the reactivation
-  state transition bug
+- `stipulate explore` with one custom invariant finds the check_win
+  game logic bug
 - `stipulate mutate` reports survived mutants with actionable suggestions
 - Seed data generator handles the demo FK graph without manual fixtures
 - State transition coverage reports match expected denominators
