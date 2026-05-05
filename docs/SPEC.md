@@ -3,6 +3,17 @@
 Declare invariants, not test cases. Automated backend verification for
 Python APIs built on FastAPI + SQLModel.
 
+## North Star
+
+Stipulate helps backend developers verify API correctness by writing
+executable invariants instead of hand-written test scenarios wherever
+possible.
+
+The goal is not to eliminate every test. The goal is to make invariants,
+schema-derived state spaces, transition coverage, exploration, and
+mutation feedback carry as much of the backend verification burden as
+they reasonably can.
+
 ## Problem
 
 LLMs generate backend code that works on the happy path but breaks on
@@ -10,64 +21,110 @@ state transitions, edge cases, and cross-entity consistency. Hand-written
 tests are brittle, specific to one scenario, and break on refactors.
 LLMs are bad at writing them. Developers don't want to write them either.
 
+The verification bottleneck has shifted from writing code to proving code
+is correct. 43% of AI-generated code needs production debugging (Sonar
+2026). 92% of Copilot-generated tests are broken without existing context
+(AST 2024). Worse: LLM test generators systematically discard
+bug-revealing tests because they filter out tests that fail (arXiv
+2412.14137). They validate bugs rather than catching them.
+
+Invariant-based verification doesn't have this problem. When you write
+`@invariant: assigned rep must exist`, that's a spec about the world, not
+about the current code. If the code violates it, that's a bug, not a bad
+test. The oracle is external to the implementation.
+
 ## Thesis
 
 If you know the state space (bounded column types, FK relationships) and
 the dependency structure (which mutations touch which fields), you can
-auto-generate test scenarios, verify invariants across the explored
+auto-generate exploration sequences, verify invariants across the explored
 state space, and use mutation testing to validate invariant quality.
 
 The developer declares what must be true. The tool finds violations.
 
 ## What the Developer Writes
 
+The developer writes FastAPI + SQLModel as they already do. They add
+`@stipulate.invariant` decorators where they have beliefs about
+correctness. That's it. No new base classes, no restructuring.
+
 ```python
-from stipulate import Module, invariant, never, after, mutation, query
+from stipulate import invariant
 
-class FacilityModule(Module):
-    class Facility(Model):
-        name: str
-        status: Literal['active', 'suspended', 'closed'] = 'active'
-        assigned_rep_id: str | None = Field(foreign_key="rep.id")
-        priority: Literal['high', 'medium', 'low', 'none'] = 'none'
+# Models — unchanged SQLModel definitions
+class Facility(SQLModel, table=True):
+    id: str = Field(default_factory=uuid4_str, primary_key=True)
+    name: str
+    status: Literal['active', 'suspended', 'closed'] = 'active'
+    assigned_rep_id: str | None = Field(default=None, foreign_key="rep.id")
+    priority: Literal['high', 'medium', 'low', 'none'] = 'none'
 
-    @invariant
-    def rep_exists_if_assigned(self, facility: Facility, db: Session):
-        if facility.assigned_rep_id:
-            assert db.get(Rep, facility.assigned_rep_id) is not None
+class Rep(SQLModel, table=True):
+    id: str = Field(default_factory=uuid4_str, primary_key=True)
+    name: str
+    active: bool = True
 
-    @never
-    def suspended_with_assignment(self, facility: Facility):
-        assert not (facility.status == 'suspended'
-                    and facility.assigned_rep_id is not None)
+# Invariants — the new part
+@invariant(reads=['facility.assigned_rep_id', 'rep.id'])
+def rep_exists_if_assigned(db: Session):
+    """Assigned reps must actually exist."""
+    orphans = db.exec(
+        select(Facility).where(
+            Facility.assigned_rep_id.isnot(None),
+            ~Facility.assigned_rep_id.in_(select(Rep.id))
+        )
+    ).all()
+    assert len(orphans) == 0, f"Dangling rep refs: {orphans}"
 
-    @after(trigger=assign_facility)
-    def cache_consistent(self, facility_id: str, db: Session):
-        f = db.get(Facility, facility_id)
-        cache = get_cache(facility_id)
-        assert cache.rep_id == f.assigned_rep_id
+@invariant(reads=['facility.status', 'facility.assigned_rep_id'])
+def no_rep_when_suspended(db: Session):
+    """Suspended facilities must not have assigned reps."""
+    bad = db.exec(
+        select(Facility).where(
+            Facility.status == 'suspended',
+            Facility.assigned_rep_id.isnot(None)
+        )
+    ).all()
+    assert len(bad) == 0, f"Suspended with rep: {bad}"
 
-    @mutation
-    def assign(self, facility_id: str, rep_id: str, db: Session):
-        facility = db.get(Facility, facility_id)
-        facility.assigned_rep_id = rep_id
-        return facility
+@invariant(reads=['facility.status'])
+def closed_is_terminal(db: Session):
+    """Closed facilities cannot be reopened."""
+    # Checked temporally: if status was 'closed' in any prior step,
+    # it must still be 'closed' now.
+    pass  # Temporal invariants use a different decorator — see below
+```
 
-    @mutation(pre=lambda f, db: f.status != 'closed')
-    def suspend(self, facility_id: str, db: Session):
-        facility = db.get(Facility, facility_id)
-        facility.status = 'suspended'
-        facility.assigned_rep_id = None
-        return facility
+```python
+# Mutations — existing business logic, no changes needed.
+# Stipulate discovers these from your FastAPI routes or from
+# explicit registration.
+
+def assign_rep(facility_id: str, rep_id: str, db: Session):
+    facility = db.get(Facility, facility_id)
+    facility.assigned_rep_id = rep_id
+    db.commit()
+
+def suspend(facility_id: str, db: Session):
+    facility = db.get(Facility, facility_id)
+    facility.status = 'suspended'
+    facility.assigned_rep_id = None
+    db.commit()
+
+def reactivate(facility_id: str, db: Session):
+    facility = db.get(Facility, facility_id)
+    facility.status = 'active'
+    # BUG: doesn't clear assigned_rep_id from before suspension
+    db.commit()
 ```
 
 ## What the Developer Doesn't Write
 
-- Test scenarios
-- Test fixtures (beyond seed data)
-- Input values (inferred from schema)
-- Boundary conditions (inferred from comparisons in invariants/mutations)
-- State transition sequences (generated from mutation × state space)
+- Test scenarios or test functions
+- Test fixtures or factory classes (beyond optional seed overrides)
+- Input values (inferred from schema types and boundary analysis)
+- State transition sequences (generated from mutations x state space)
+- Boundary conditions (inferred from comparisons in invariant ASTs)
 
 ## What the Tool Does
 
@@ -81,120 +138,96 @@ Read SQLModel table definitions. Extract:
   None, valid reference, dangling reference
 - **Nullable fields** — `str | None` → domain includes None
 - **Pydantic validators** — constraints on valid inputs
+- **FK dependency graph** — which tables depend on which, for seed ordering
 
 The schema IS the state space declaration. No extra annotations needed
 for the common case.
 
-### 2. Boundary Value Inference
+### 2. Seed Data Generation
 
-Read invariant and mutation function bodies via AST inspection (not
-string parsing — use Python's `ast` module which is reliable, unlike
-JS `fn.toString()`). Extract comparisons:
+The hardest unsolved problem in backend test automation. Stipulate reads
+the FK dependency graph, topologically sorts entities, and generates
+valid seed data automatically.
 
-- `balance > Decimal('10000')` → boundary values: [9999.99, 10000, 10000.01]
-- `len(items) >= 3` → boundary values: [2, 3, 4]
-- `status != 'closed'` → values: ['closed', 'active']
-- `assigned_rep_id is not None` → values: [None, <valid FK>]
+Required behavior:
 
-Python's `ast` module gives us the full AST of any function body.
-This is fundamentally more reliable than JavaScript's fn.toString()
-regex parsing. We can walk the AST, find all `Compare` nodes, extract
-the comparator values, and generate boundary inputs mechanically.
+- read FK graph from SQLModel metadata;
+- topological sort: create Rep before Facility (because Facility has FK
+  to Rep);
+- generate valid field values from column types and constraints;
+- handle unique constraints without collision;
+- support bounded fields: enumerate Literal values, bool values;
+- support FK fields: None, valid reference;
+- expose seed overrides for cases where the schema isn't enough;
+- reset DB state between exploration runs.
 
-### 3. Mutation Discovery
+The seed data generator is not a factory library. It reads the schema
+and produces the minimal set of entities needed for exploration to have
+something to work with. For a Facility with FK to Rep, that's one Rep
+and one Facility.
 
-Every `@mutation` is a declared state transition. The tool knows:
-- What fields it can write (from AST: find all attribute assignments)
-- What preconditions must hold (from `pre=` parameter)
-- What entities it touches (from type annotations)
+### 3. Boundary Value Inference
 
-Combined with the schema, this gives the full "what can change and when"
-picture without runtime tracing.
+Read invariant function bodies via Python's `ast` module. Extract
+comparisons and derive boundary values:
+
+- `balance > Decimal('10000')` → [9999.99, 10000, 10000.01]
+- `len(items) >= 3` → [2, 3, 4]
+- `status != 'closed'` → ['closed', 'active']
+- `assigned_rep_id is not None` → [None, <valid FK>]
+
+Python's `ast` module gives us the full AST of any function body. This
+is reliable — unlike JavaScript's fn.toString() fragility. We walk the
+AST, find Compare nodes, extract comparator values, and feed them into
+the exploration strategies.
 
 ### 4. Exploration Engine
 
-Given schema (state space) + mutations (transitions) + invariants (specs):
+Two modes, both checking invariants after each step:
 
-**Phase 1: Single-state invariant checking**
+**Direct mode (development, fast):**
 
-For each entity type, generate instances in every combination of
-bounded field values. Check all invariants against each combination.
+Call mutation functions directly with a test Session. No HTTP, no
+FastAPI routing, no serialization. ~1000 steps/second.
 
-- Facility with status='active', assigned_rep_id=None, priority='high'
-- Facility with status='active', assigned_rep_id=<valid>, priority='high'
-- Facility with status='suspended', assigned_rep_id=None, priority='high'
-- ... (3 statuses × 3 FK states × 4 priorities = 36 combinations)
+1. Create test DB + seed data from schema
+2. For each mutation sequence of length 1..N:
+   a. Call mutation function with generated arguments
+   b. Check all invariants against the DB
+   c. Record state transitions (column value changes)
+   d. If violation → record, shrink, report
+3. Coverage-directed: bias toward uncovered transitions
+4. Adversarial: for each invariant, AST-analyze what state would
+   violate it, search for mutation sequences reaching that state
 
-This catches invariant violations that exist in specific states without
-needing any mutations.
+**API mode (CI, thorough):**
 
-**Phase 2: Mutation sequence exploration**
+Drive through HTTP via Schemathesis, checking invariants after each
+response. Slower (~10-50 steps/second) but tests the real stack
+including middleware, auth, serialization, and validation.
 
-Generate sequences of mutation calls. For each sequence:
+1. Read OpenAPI spec from FastAPI
+2. Schemathesis generates endpoint calls with schema-aware strategies
+3. Inject valid FK references from seed data into strategies
+4. After each response, check all invariants against the DB
+5. Record state transitions
 
-1. Seed the DB with valid entities
-2. Apply mutation 1 → check all invariants
-3. Apply mutation 2 → check all invariants
-4. ...
-
-Sequence generation strategy:
-- Start with single-mutation sequences (every mutation with every valid
-  input combination from the schema)
-- Then 2-mutation sequences: every pair of mutations
-- Coverage-directed: track which field value transitions were exercised,
-  bias toward uncovered transitions
-- Adversarial: for each invariant, try to construct a mutation sequence
-  that violates it (backward from the invariant to find which mutations
-  could put the system in a violating state)
-
-For the adversarial pass, read the invariant's AST to determine what
-state would violate it, then search for a mutation sequence that reaches
-that state.
-
-**Phase 3: Temporal / after-trigger checking**
-
-For each `@after` contract:
-1. Execute the trigger mutation
-2. Check the property
-3. For `eventually` contracts: execute additional mutations/operations
-   and re-check
-
-**Phase 4: External operation outcome exploration**
-
-For mutations that call external services with declared outcomes:
-
-```python
-@mutation
-async def check_claim_status(self, claim_id: str, db: Session):
-    result = await availity.check(claim_id)  # external call
-    ...
-
-    class Outcomes:
-        domain = ['paid', 'denied', 'pending', 'error']
-```
-
-The tool mocks the external call and exercises each declared outcome,
-checking invariants after each.
-
-**Phase 5: Coverage-directed walks**
-
-After targeted exploration, fill coverage gaps:
-- Find field transitions never exercised
-- Find FK relationship states never reached (dangling reference)
-- Find invariants never triggered (dead invariant warning)
-- Generate mutation sequences toward uncovered states
+Most exploration happens in direct mode. API mode catches HTTP-layer
+bugs that direct mode misses.
 
 ### 5. State Transition Coverage
 
-After exploration, report which column-level transitions were exercised:
+After exploration, report which column-level transitions were exercised.
+This is the genuinely novel metric — no existing Python tool provides it.
 
 ```
 Facility.status transitions:
   active → suspended      ✓ (3x)
   active → closed          ✓ (1x)
-  suspended → active       ✗ NEVER TESTED
+  suspended → active       ✓ (2x)
   suspended → closed       ✗ NEVER TESTED
-  closed → active          ✗ NEVER TESTED
+  closed → active          ✗ NEVER TESTED  (should be impossible)
+  closed → suspended       ✗ NEVER TESTED  (should be impossible)
 
 Facility.assigned_rep_id transitions:
   None → valid_ref         ✓ (2x)
@@ -204,101 +237,201 @@ Facility.assigned_rep_id transitions:
 
 Invariant exercise count:
   rep_exists_if_assigned     4 scenarios, 0 violations
-  suspended_with_assignment  2 scenarios, 0 violations
-  cache_consistent           0 scenarios  ← NEVER TRIGGERED
+  no_rep_when_suspended      2 scenarios, 1 VIOLATION
+  closed_is_terminal         0 scenarios  ← NEVER TRIGGERED
 ```
+
+The denominator for each field comes from the declared domain (Literal
+values, FK states). Gaps are reported honestly.
 
 ### 6. Mutation Testing
 
-Inject faults into mutation functions to verify invariant quality:
+Inject faults into mutation functions to verify invariant quality.
+In-process AST transformation — no file I/O, no process restart.
 
-**Mutation operators:**
-- **Skip assignment** — `facility.status = 'suspended'` → skip it
-- **Flip comparison** — `balance > 0` → `balance >= 0` or `balance < 0`
-- **Drop side effect** — `facility.assigned_rep_id = None` → skip it
-- **Null a FK** — `facility.assigned_rep_id = rep.id` → set to None
-- **Swap value** — `status = 'approved'` → `status = 'denied'`
-- **Remove precondition** — `pre=lambda f: f.status != 'closed'` → no precondition
+```python
+# Original
+facility.assigned_rep_id = None
+
+# Mutant: skip assignment
+# (AST: remove the Assign node)
+
+# Mutant: swap value
+facility.assigned_rep_id = rep_id  # instead of None
+
+# Mutant: flip comparison
+if facility.status != 'closed':  →  if facility.status == 'closed':
+```
 
 For each mutant:
-1. Re-run the exploration engine (fast — just function calls + test DB)
-2. Check if any invariant detects the mutation
-3. If no invariant fires → report as survived mutant (coverage gap)
+1. AST-transform the function, compile, monkey-patch the module
+2. Re-run the exploration loop (fast — direct mode, in-process)
+3. Check if any invariant fires
+4. Un-patch, move to next mutant
 
-Report: "Your invariants caught 73% of injected faults. These mutations
-survived: [skip assignment in suspend.assigned_rep_id = None] — suggests
-missing invariant about assignment cleanup on suspension."
+Report:
+```
+Mutation score: 4/5 (80%)
 
-### 7. pytest Plugin
+Killed:
+  ✓ skip `facility.status = 'suspended'` in suspend() — caught by no_rep_when_suspended
+  ✓ skip `facility.assigned_rep_id = None` in suspend() — caught by no_rep_when_suspended
+  ✓ flip `status != 'closed'` in suspend() — caught by closed_is_terminal
+  ✓ skip `facility.assigned_rep_id = rep_id` in assign() — caught by rep_exists_if_assigned
+
+Survived:
+  ✗ skip `db.commit()` in assign() — NO INVARIANT DETECTED THIS
+    → Suggestion: your invariants check DB state but don't verify
+      the write actually persisted. Consider a temporal invariant.
+```
+
+### 7. pytest Integration
 
 ```python
 # conftest.py
 from stipulate.pytest import create_explorer
 
 @pytest.fixture
-def explorer(app, test_db):
-    return create_explorer(app, test_db, budget=500)
+def explorer(test_db):
+    return create_explorer(
+        models=[Facility, Rep],
+        mutations=[assign_rep, suspend, reactivate, close],
+        invariants=[rep_exists_if_assigned, no_rep_when_suspended],
+        db=test_db,
+        budget=500,
+    )
 
 # test_contracts.py
 def test_facility_invariants(explorer):
     result = explorer.run()
 
     assert result.violations == []
-    assert result.state_coverage.percentage > 80
-    assert result.mutation_score > 70
+    assert result.transition_coverage.percentage > 80
+
+def test_mutation_score(explorer):
+    result = explorer.mutate()
+
+    assert result.score > 70
+    assert result.survived == []
 ```
 
 Zero hand-written test scenarios.
 
 ## Architecture
 
+### What Stipulate builds (the new parts)
+
 ```
 stipulate/
 ├── core/
-│   ├── registry.py        # Invariant/mutation/module registration
-│   ├── schema.py          # SQLModel introspection → state space
-│   ├── ast_analysis.py    # Python AST → boundary values, field writes
-│   └── types.py           # Core types: Invariant, Mutation, Domain, etc.
+│   ├── invariant.py       # @invariant decorator + global DB invariant model
+│   ├── schema.py          # SQLModel introspection → FK graph, state space
+│   ├── seed.py            # FK-aware seed data generation
+│   └── types.py           # Core types: Invariant, StateSpace, Transition
 ├── explore/
-│   ├── engine.py          # Main exploration loop
-│   ├── sequence.py        # Mutation sequence generation
-│   ├── adversarial.py     # Backward from invariant → violating sequence
-│   ├── coverage.py        # State transition coverage tracking
-│   └── seed.py            # Generate valid seed entities from schema
+│   ├── engine.py          # Direct-mode exploration loop
+│   ├── sequence.py        # Mutation sequence generation + shrinking
+│   ├── boundary.py        # AST boundary value inference
+│   └── coverage.py        # State transition coverage tracking
 ├── mutate/
-│   ├── operators.py       # Mutation operators (skip, flip, null, swap)
-│   ├── runner.py          # Re-run exploration per mutant
+│   ├── operators.py       # AST mutation operators (skip, flip, swap)
+│   ├── runner.py          # In-process mutate + re-explore loop
 │   └── report.py          # Mutation score + survived mutant details
 ├── integrations/
-│   ├── fastapi.py         # Auto-generate routes from @mutation/@query
-│   ├── hypothesis.py      # Schema → Hypothesis strategies
-│   └── schemathesis.py    # OpenAPI fuzz integration
+│   ├── schemathesis.py    # API-mode hooks: seed injection + invariant checking
+│   └── hypothesis.py      # Schema → Hypothesis strategies
 ├── report/
 │   ├── console.py         # Terminal output
-│   ├── json.py            # CI-consumable JSON
-│   └── html.py            # Visual coverage report
+│   └── json.py            # CI-consumable JSON
 └── pytest_plugin.py       # pytest integration
 ```
 
-## Dependencies
+### What Stipulate composes (existing tools)
 
-- **SQLModel** — schema introspection (reads table definitions)
-- **Pydantic** — request/response model introspection
-- **Hypothesis** — value generation from types
-- **Schemathesis** — OpenAPI endpoint fuzzing (complementary, not primary)
+- **Hypothesis** — value generation from types + boundary values
+- **Schemathesis** — API-mode exploration via OpenAPI (CI)
+- **Python `ast`** — boundary inference + in-process mutation operators
 - **pytest** — test runner integration
-- Python `ast` module — function body analysis (stdlib, no deps)
 
-## What This Doesn't Do
+### What Stipulate does NOT use
 
-- **Visual regression testing** — tests behavior, not appearance
-- **Performance testing** — tests correctness, not speed
-- **External service verification** — tests YOUR handling of external
-  outcomes, not the external service itself
-- **Replace all tests** — regression tests from production incidents
-  still need to be expressed as invariants manually
-- **Work with untyped code** — requires SQLModel/Pydantic type annotations.
-  No types = no state space = no exploration.
+- icontract / Deal — wrong invariant model (function-level, not DB-level)
+- mutmut — too slow (file I/O + process restart per mutant)
+- A custom contract DSL — Python decorators on Python functions
+
+## Invariant Model
+
+Backend invariants are different from function pre/postconditions. They
+are global state invariants that read from the database and are checked
+after each exploration step.
+
+Required properties:
+
+- Invariants take a `Session` and read from the DB.
+- Invariants declare which tables/columns they read (for exploration
+  dependency tracking).
+- Invariants are checked after every exploration step, not tied to a
+  specific function call.
+- Violations include the invariant name, the DB state, and the
+  reproducing mutation sequence.
+- Temporal invariants (e.g., "closed is terminal") track state across
+  steps and check that forbidden transitions never occur.
+
+## Demo Plan
+
+The demo uses a simplified facility management API (3 models, 4
+mutations) and shows two moments:
+
+### Wow 1: "5 lines of invariants, found a real bug in 2 seconds"
+
+1. Show the SQLModel models (Facility, Rep) — standard code, nothing new.
+2. Show 3 invariant decorators (8 lines total).
+3. Run `stipulate explore`.
+4. Tool reads schema, generates seed data, explores ~500 mutation
+   sequences in <2 seconds.
+5. Reports a violation:
+
+```
+VIOLATION: no_rep_when_suspended
+
+  After: assign_rep('f1', 'r1') → suspend('f1') → reactivate('f1')
+
+  Facility(id='f1', status='active', assigned_rep_id='r1')
+  ↑ reactivate() set status back to 'active' but didn't clear
+    assigned_rep_id. During suspension, the rep was "released" —
+    but reactivate() brought back the stale reference.
+
+  Transition: suspended → active (with assigned_rep_id='r1')
+
+  Coverage: 12/18 transitions (67%), 2/3 invariants exercised
+```
+
+The developer wrote zero test scenarios. The tool found a 3-step state
+transition bug.
+
+### Wow 2: "Your invariants are too weak — here's the proof"
+
+1. Fix the bug in `reactivate()`: add `facility.assigned_rep_id = None`.
+2. Run `stipulate explore` — all invariants pass.
+3. Run `stipulate mutate`.
+4. Tool generates 8 AST mutants, re-explores for each in <5 seconds.
+5. Reports:
+
+```
+Mutation score: 6/8 (75%)
+
+Survived:
+  ✗ Removed `facility.assigned_rep_id = None` from reactivate()
+    → No invariant checks that reactivation clears assignment.
+    → Consider: @invariant checking that active facilities
+      reactivated from suspension have no rep.
+
+  ✗ Removed `db.commit()` from close()
+    → No invariant detected uncommitted close.
+```
+
+Developer adds one more invariant. Re-runs mutate. Score: 7/8 (88%).
+The feedback loop converges.
 
 ## Relationship to Veriscope
 
@@ -311,34 +444,62 @@ verify invariants, measure coverage, mutation-test the specs.
 | State space | Signal domains (bool, enum) | Column types (Literal, FK, bool) |
 | Transitions | Signal value changes | Mutation calls |
 | Dependency graph | Signal → derived → effect | Mutation → field writes → invariant reads |
-| Assertions | assertAlways, assertAfter | @invariant, @after |
+| Assertions | assertAlways, assertAfter | @invariant, temporal |
 | Exploration | Backward cone enumeration | Mutation sequence generation |
 | Coverage | Toggle, transition, cross | Field transitions, invariant exercise |
-| Mutation testing | Graph mutations (sever, negate) | Code mutations (skip, flip, null) |
-| Boundary inference | fn.toString() parsing (fragile) | Python AST analysis (reliable) |
-
-The key advantage on backend: Python's `ast` module gives us reliable
-function body analysis. No fn.toString() fragility. We can walk the AST,
-find every comparison, extract every constant, generate every boundary
-value mechanically.
+| Mutation testing | Graph mutations (sever, negate) | Code mutations (skip, flip, swap) |
+| Speed | ~1000 states/sec (direct graph) | ~1000 states/sec (direct calls) |
 
 ## Design Principles
 
-1. **Schema is the spec.** SQLModel types declare the state space.
-   No extra domain annotations for the common case.
+1. **Decorators on existing code.** No new base classes, no Module
+   wrappers, no restructuring. The developer's FastAPI + SQLModel code
+   stays exactly as it is.
 
-2. **Inference first, hints as fallback.** Boundary values from AST.
-   State spaces from types. Sequences from mutation signatures.
-   Explicit hints (`boundaryHints`, `sequenceHints`) only when
-   inference can't see enough.
+2. **Schema is the state space.** SQLModel types declare bounded fields,
+   FK relationships, and nullability. No extra domain annotations for
+   the common case.
 
-3. **No new DSL.** Python decorators on Python functions. LLMs already
-   know how to write this.
+3. **Compose, don't rebuild.** Hypothesis for generation, Schemathesis
+   for API-mode, Python ast for analysis. Build only what doesn't exist:
+   seed data, transition coverage, the exploration glue, in-process
+   mutation.
 
-4. **Mutations are the only way state changes.** If a state change
-   doesn't go through a `@mutation`, the tool can't see it. This is
-   the discipline tradeoff — same as Comb requiring `always @(event)`.
+4. **Fast by default.** Direct-mode exploration at ~1000 steps/sec.
+   Mutation testing in-process with AST patching. API mode is opt-in
+   for CI.
 
-5. **Fast feedback.** Exploration runs against a test DB with no
-   network, no browser, no external services. Hundreds of scenarios
-   per second.
+5. **Honest coverage.** Transition coverage reports what was and wasn't
+   exercised with explicit denominators. Gaps are reported, not hidden.
+
+6. **The feedback loop is the product.** Explore → find violations →
+   fix code → mutate → find weak invariants → strengthen → repeat.
+   The tool is a conversation partner, not a one-shot generator.
+
+## What This Doesn't Do
+
+- **Visual or UI testing** — tests backend state, not appearance
+- **Performance testing** — tests correctness, not speed
+- **External service verification** — tests YOUR handling of declared
+  outcomes, not the external service itself
+- **Replace all tests** — regression tests from production incidents
+  still need manual invariants; integration tests with mocked external
+  services are out of scope
+- **Work with untyped code** — requires SQLModel type annotations.
+  No types = no state space = no exploration
+- **Infer business logic** — "NPA counts as approved" must be declared
+  by the developer or LLM. The tool verifies declared invariants, it
+  doesn't guess what they should be
+
+## Ship Gate
+
+Before treating Stipulate as coherent, the repo should satisfy:
+
+- `stipulate explore` finds the reactivation bug in the demo app
+- `stipulate mutate` reports survived mutants with actionable suggestions
+- Seed data generator handles the demo FK graph without manual fixtures
+- State transition coverage reports match expected denominators
+- Mutation testing completes in <10 seconds for the demo app
+- pytest plugin runs explore + mutate in a standard test suite
+- Console output is clear enough that a developer unfamiliar with
+  Stipulate can understand what went wrong and what to do about it
