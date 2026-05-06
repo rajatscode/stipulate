@@ -25,7 +25,7 @@ from stipulate.core.schema_check import check_schema
 from stipulate.core.transitions import clear_transition_rules, ignore_transition
 from stipulate.core.transitions import check_forbidden_transitions, diff_snapshots, snapshot
 from stipulate.report import exploration_to_dict, mutation_to_dict
-from stipulate.report.console import print_explore_result
+from stipulate.report.console import print_explore_result, print_mutation_result
 
 
 class Game(SQLModel, table=True):
@@ -895,7 +895,7 @@ def main() -> int:
         if args.json:
             print(json.dumps(mutation_to_dict(result), indent=2, sort_keys=True))
         else:
-            print(result.report_text())
+            print_mutation_result(result)
         return 1 if result.unexpected_survivors else 0
 
     if args.command == "serve":

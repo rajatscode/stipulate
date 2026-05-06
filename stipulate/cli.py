@@ -13,7 +13,7 @@ from stipulate.config import (
 )
 from stipulate.core.utils import call_with_supported_kwargs, import_object
 from stipulate.report import drift_to_dict, exploration_to_dict, mutation_to_dict
-from stipulate.report.console import print_explore_result
+from stipulate.report.console import print_explore_result, print_mutation_result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mutate":
         with open_configured_db(config, args.db) as db:
             result = config.create_explorer(db).mutate()
-        _print_json(mutation_to_dict(result)) if args.json else print(result.report_text())
+        _print_json(mutation_to_dict(result)) if args.json else print_mutation_result(result)
         return 1 if result.unexpected_survivors else 0
 
     if args.command == "api":
