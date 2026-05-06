@@ -49,6 +49,14 @@ stipulate api --app myapp.main:app --db myapp.tests:session_factory
 stipulate api --generator schemathesis --app myapp.main:app --db myapp.tests:session_factory
 ```
 
+Run the Minesweeper demo from the spec:
+
+```bash
+.venv/bin/python examples/minesweeper_demo.py serve
+.venv/bin/python examples/minesweeper_demo.py validate
+.venv/bin/python examples/minesweeper_demo.py explore
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
