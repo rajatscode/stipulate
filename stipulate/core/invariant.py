@@ -114,6 +114,15 @@ def infer_invariant_reads(fn: Callable[..., Any], models: list[type]) -> tuple[s
     return tuple(sorted(reads))
 
 
+def _postcondition_matches(spec: PostconditionSpec, action: Any) -> bool:
+    if spec.action is action:
+        return True
+    if isinstance(spec.action, str):
+        action_name = getattr(action, "name", None)
+        return spec.action == action_name
+    return False
+
+
 def check_postconditions(
     session: Any,
     action: Any,
@@ -123,7 +132,7 @@ def check_postconditions(
     failures: list[CheckFailure] = []
     for fn in postconditions:
         spec = getattr(fn, "__stipulate_postcondition__", None)
-        if spec is None or spec.action is not action:
+        if spec is None or not _postcondition_matches(spec, action):
             continue
         try:
             call_with_supported_kwargs(fn, {"db": session, **params})

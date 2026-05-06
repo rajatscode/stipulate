@@ -1,0 +1,26 @@
+[tool.stipulate]
+models = [
+    "minesweeper.models:Game",
+    "minesweeper.models:Cell",
+]
+actions = [
+    "minesweeper.actions:reveal_action",
+    "minesweeper.actions:flag_action",
+    "minesweeper.actions:check_win_action",
+    "minesweeper.actions:delete_game_action",
+]
+invariants = [
+    "minesweeper.invariants:revealed_mine_means_lost",
+    "minesweeper.invariants:mine_counts_accurate",
+]
+postconditions = [
+    "minesweeper.invariants:win_detected",
+]
+transitions = "minesweeper.transitions"
+seeds = [
+    "minesweeper.seeds:game_seed",
+    "minesweeper.seeds:cell_seeds",
+]
+db = "minesweeper.db:create_db"
+budget = 500
+max_depth = 3
