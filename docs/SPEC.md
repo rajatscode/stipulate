@@ -59,7 +59,7 @@ onboarding baseline, but the real value starts when the developer writes
 business invariants — rules that no schema or ORM constraint can express.
 
 ```python
-from stipulate import invariant, forbid_transition
+from stipulate import invariant, forbid_transition, ignore_transition
 
 # Models — unchanged SQLModel definitions
 class Game(SQLModel, table=True):
@@ -115,6 +115,10 @@ forbid_transition(Game.status, from_='won', to='lost')
 forbid_transition(Game.status, from_='won', to='playing')
 forbid_transition(Cell.state, from_='revealed', to='flagged')
 forbid_transition(Cell.state, from_='revealed', to='hidden')
+
+# Noisy unseen transitions — not forbidden, just irrelevant
+ignore_transition(Game.status, from_='lost', to='ready')
+ignore_transition(Game.status, from_='won', to='ready')
 ```
 
 ```python
@@ -292,7 +296,7 @@ Both modes run during exploration. Budget split is configurable
 flag_cell on a revealed cell, the function succeeds (no guard), and
 the forbidden transition `revealed → flagged` fires:
 
-> [unguarded] flag_cell(2, 2) on revealed cell triggered forbidden
+> [unguarded] flag_cell(1, 1) on revealed cell triggered forbidden
 > transition Cell.state: revealed → flagged.
 
 This resolves the tension: the action model declares the expected
@@ -371,12 +375,14 @@ with engine.connect() as conn:
 - Invariant checks see flushed state after each successful step.
 - Shrinking replays sequences from the same seed state.
 
-**Limitation:** commit interception means direct mode does not exercise
-real commit behavior: `after_commit` hooks, session expiration,
-transaction boundary effects, and code that depends on actual commit
-semantics may behave differently. This is acceptable for the
-exploration feedback loop. API mode (Schemathesis through HTTP) uses
-real commits and catches commit-dependent bugs.
+**Limitations of direct mode:**
+
+- Commit interception means `after_commit` hooks, session expiration,
+  and transaction boundary effects are not exercised. API mode uses
+  real commits and catches commit-dependent bugs.
+- Mutations must use the provided session. Code that creates its own
+  sessions, calls `session.rollback()`, or manages independent
+  transactions will not work correctly under commit interception.
 
 ## What the Tool Does
 
@@ -607,7 +613,7 @@ Game.status transitions (denominator: 12 pairs - 4 forbidden = 8):
 Cell.state transitions (denominator: 6 pairs - 2 forbidden = 4):
   Observed: 2/4
     hidden → revealed      ✓ (8x)
-    hidden → flagged       ✓ (2x)
+    hidden → flagged       ✓ (2x)  — guarded exploration on hidden cells
   Unseen: 2/4
     flagged → hidden       (unflag not implemented?)
     flagged → revealed     (unflag then reveal?)
@@ -963,10 +969,11 @@ VIOLATION: [forbidden] Game.status: lost → won
   set status='won'. No loss-state guard.
 
 VIOLATION: [forbidden] Cell.state: revealed → flagged
-  After: [unguarded] flag_cell(2, 2)
+  After: [unguarded] flag_cell(1, 1)
   flag_cell() succeeded on a revealed cell — no guard.
   (Found via unguarded exploration: action model says "only flag hidden
-   cells," but the function accepts any cell.)
+   cells," but the function accepts any cell. Cell (1,1) was pre-revealed
+   in the seed.)
 
 VIOLATION: [schema] orphan_detection
   After: delete_game('g1')
