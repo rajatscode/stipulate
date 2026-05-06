@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stipulate"
+version = "0.1.0"
+description = "Executable backend invariants and state-transition exploration for SQLModel apps."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlmodel>=0.0.16",
+    "sqlalchemy>=2.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+stipulate = "stipulate.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["stipulate*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
