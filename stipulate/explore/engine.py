@@ -4,6 +4,13 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from stipulate.core.action import Action, BoundCall, Discard, Reject
+from stipulate.core.external import (
+    ExternalCase,
+    current_external_calls,
+    declared_exception,
+    external_case_sets,
+    external_override,
+)
 from stipulate.core.invariant import check_invariants, check_postconditions
 from stipulate.core.result import CheckFailure, ExplorationResult, TransitionEvent, Violation
 from stipulate.core.schema_check import check_schema
@@ -128,7 +135,19 @@ class Explorer:
                 return
             if len(result.violations) >= self.config.max_violations:
                 return
-            self._execute_branch(call=call, prefix=prefix, depth=depth, result=result)
+            case_sets = external_case_sets(call.action.fn_obj) or [()]
+            for external_cases in case_sets:
+                if result.steps_executed >= self.config.budget:
+                    return
+                if len(result.violations) >= self.config.max_violations:
+                    return
+                self._execute_branch(
+                    call=call,
+                    prefix=prefix,
+                    depth=depth,
+                    result=result,
+                    external_cases=external_cases,
+                )
 
     def _execute_branch(
         self,
@@ -137,13 +156,22 @@ class Explorer:
         prefix: tuple[str, ...],
         depth: int,
         result: ExplorationResult,
+        external_cases: tuple[ExternalCase, ...] = (),
     ) -> None:
-        sequence = (*prefix, call.label)
+        label = call.label
+        if external_cases:
+            label = f"{label} [{' x '.join(case.label for case in external_cases)}]"
+        sequence = (*prefix, label)
         before = snapshot(self.db, self.models)
         step = self.db.begin_nested()
         result.steps_executed += 1
+        action_name = call.action.name or "action"
+        result.actions_executed[action_name] = result.actions_executed.get(action_name, 0) + 1
+        external_calls: list[ExternalCase] = []
         try:
-            call.action.invoke(self.db, call)
+            with external_override(external_cases):
+                call.action.invoke(self.db, call)
+                external_calls = current_external_calls()
             self.db.flush()
         except Discard:
             step.rollback()
@@ -169,6 +197,29 @@ class Explorer:
         except Exception as exc:
             step.rollback()
             self.db.expire_all()
+            failed_external = declared_exception(external_cases, exc)
+            if failed_external is not None:
+                self._record_external_case(result, failed_external)
+                self._record_violation(
+                    result,
+                    _violation(
+                        CheckFailure(
+                            kind="external",
+                            name=failed_external.name,
+                            message=(
+                                f"{failed_external.name}.{failed_external.outcome} propagated "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            details={
+                                "external": failed_external.name,
+                                "outcome": failed_external.outcome,
+                                "exception": type(exc).__name__,
+                            },
+                        ),
+                        sequence,
+                    ),
+                )
+                return
             self._record_violation(
                 result,
                 _violation(
@@ -181,6 +232,9 @@ class Explorer:
                 ),
             )
             return
+
+        for called_case in external_calls:
+            self._record_external_case(result, called_case)
 
         after = snapshot(self.db, self.models)
         events = diff_snapshots(before, after)
@@ -231,6 +285,12 @@ class Explorer:
         self._seen_violation_keys.add(key)
         result.violations.append(violation)
 
+    def _record_external_case(self, result: ExplorationResult, case: ExternalCase | None) -> None:
+        if case is None:
+            return
+        outcomes = result.external_coverage.setdefault(case.name, {})
+        outcomes[case.outcome] = outcomes.get(case.outcome, 0) + 1
+
 
 def _violation(failure: CheckFailure, sequence: tuple[str, ...]) -> Violation:
     return Violation(
@@ -259,5 +319,12 @@ def _violation_key(violation: Violation) -> tuple[Any, ...]:
             details.get("model"),
             details.get("field"),
             details.get("referenced_model"),
+        )
+    if violation.kind == "external":
+        return (
+            violation.kind,
+            details.get("external"),
+            details.get("outcome"),
+            details.get("exception"),
         )
     return (violation.kind, violation.name, violation.message)

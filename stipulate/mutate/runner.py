@@ -8,6 +8,17 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
+DEFAULT_STRING_POOL = (
+    "ready",
+    "playing",
+    "won",
+    "lost",
+    "hidden",
+    "revealed",
+    "flagged",
+)
+
+
 @dataclass(frozen=True)
 class Mutant:
     id: str
@@ -41,6 +52,31 @@ class MutationResult:
     @property
     def score(self) -> tuple[int, int]:
         return (len(self.killed), len(self.results))
+
+    @property
+    def score_percent(self) -> float:
+        if not self.results:
+            return 100.0
+        return len(self.killed) / len(self.results) * 100
+
+    def report_text(self) -> str:
+        killed, total = self.score
+        lines = [f"Mutation score: {killed}/{total} ({self.score_percent:.0f}%)", ""]
+        lines.append("Killed:")
+        if self.killed:
+            for result in self.killed:
+                names = ", ".join(sorted({violation.name for violation in result.violations}))
+                lines.append(f"  KILLED {result.mutant.description} - {names or 'violation'}")
+        else:
+            lines.append("  none")
+        lines.append("")
+        lines.append("Survived:")
+        if self.survived:
+            for result in self.survived:
+                lines.append(f"  SURVIVED {result.mutant.description}")
+        else:
+            lines.append("  none")
+        return "\n".join(lines)
 
 
 def generate_mutants(fn: Callable[..., Any]) -> list[Mutant]:
@@ -77,6 +113,22 @@ def generate_mutants(fn: Callable[..., Any]) -> list[Mutant]:
                     description=f"flip if condition in {fn.__name__}()",
                 )
             )
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for value in DEFAULT_STRING_POOL:
+                if value == node.value:
+                    continue
+                mutants.append(
+                    _compile_mutant(
+                        fn,
+                        tree,
+                        target=node,
+                        replacement=ast.Constant(value=value),
+                        mutant_id=f"{fn.__name__}:swap-constant:{index}:{node.value}->{value}",
+                        description=(
+                            f"swap {node.value!r} -> {value!r} in {fn.__name__}()"
+                        ),
+                    )
+                )
     return [mutant for mutant in mutants if mutant is not None]
 
 

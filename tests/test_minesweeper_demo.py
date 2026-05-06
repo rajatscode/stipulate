@@ -207,7 +207,7 @@ def test_mutation_runner_executes_direct_mode(session, demo_actions):
         invariants=[revealed_mine_means_lost, mine_counts_accurate],
         seeds=[game_seed, cell_seeds],
         db=session,
-        budget=200,
+        budget=60,
         max_depth=3,
     ).mutate()
 

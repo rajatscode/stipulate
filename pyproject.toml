@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Executable backend invariants and state-transition exploration for SQLModel apps."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
     "sqlmodel>=0.0.16",
     "sqlalchemy>=2.0",

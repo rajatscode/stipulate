@@ -30,6 +30,8 @@ class TransitionEvent:
 class ExplorationResult:
     violations: list[Violation] = field(default_factory=list)
     coverage: dict[str, Any] = field(default_factory=dict)
+    external_coverage: dict[str, dict[str, int]] = field(default_factory=dict)
+    actions_executed: dict[str, int] = field(default_factory=dict)
     transitions: list[TransitionEvent] = field(default_factory=list)
     steps_executed: int = 0
     postconditions_skipped: bool = False

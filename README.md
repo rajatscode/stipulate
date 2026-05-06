@@ -16,10 +16,12 @@ The product spec lives in [docs/SPEC.md](docs/SPEC.md).
 
 ## Status
 
-This repository is in early implementation. The first vertical slice targets
-direct-mode exploration for SQLModel apps: action binding, seed helpers,
+This repository is in early implementation. The current implementation covers
+direct-mode exploration for SQLModel apps, action binding, seed helpers,
 schema-derived checks, forbidden transitions, custom invariants, action
-postconditions, and transition coverage.
+postconditions, transition coverage, external outcome mocking, drift detection,
+basic mutation reporting, config loading, a CLI, and an API-mode invariant
+checker hook.
 
 ## Development
 
