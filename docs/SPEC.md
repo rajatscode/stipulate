@@ -6,9 +6,9 @@ exercised.
 
 ## North Star
 
-Stipulate helps backend developers verify API correctness by writing
-executable invariants instead of hand-written test scenarios wherever
-possible.
+Stipulate helps backend developers verify the stateful correctness behind
+their APIs by writing executable invariants instead of hand-written test
+scenarios wherever possible.
 
 The goal is not to eliminate every test. The goal is to make invariants,
 schema-derived state spaces, transition coverage, exploration, and
@@ -42,17 +42,22 @@ bug, not a bad test. The oracle is external to the implementation.
 ## Thesis
 
 If you know the state space (bounded column types, FK relationships) and
-the dependency structure (which mutations touch which fields), you can
-auto-generate exploration sequences, verify invariants across the explored
-state space, and use mutation testing to validate invariant quality.
+the callable actions that move entities through it, you can generate
+exploration sequences, observe which fields actually changed, verify
+invariants across the explored state space, and use mutation testing to
+validate spec quality.
 
 The developer declares what must be true. The tool finds violations.
 
 ## What the Developer Writes
 
-The developer writes FastAPI + SQLModel as they already do. They add
+The developer writes FastAPI + SQLModel as they already do. In v1 they
+also register actions: small descriptors that say which business
+functions are callable, how to bind their arguments, and which exceptions
+mean generated bad input versus a real bug. They add
 `@stipulate.invariant` decorators where they have beliefs about
-correctness, and `@forbid_transition` for lifecycle rules.
+correctness, `@forbid_transition` for lifecycle rules, and seed overrides
+when schema-derived data is not enough.
 
 Schema-derived checks (FK integrity, enum validity) provide a useful
 onboarding baseline, but the real value starts when the developer writes
@@ -174,9 +179,11 @@ def delete_game(game_id: str, db: Session):
 
 - Test scenarios or test functions
 - Test fixtures or factory classes (beyond seed overrides)
-- Input values (inferred from schema types and boundary analysis)
-- State transition sequences (generated from mutations x state space)
-- Boundary conditions (inferred from comparisons in invariant ASTs)
+- Input values for schema-backed params (inferred from schema types,
+  seed data, and boundary analysis)
+- State transition sequences (generated from actions x state space)
+- Common boundary conditions (opportunistically inferred from simple
+  comparisons in invariant/action ASTs)
 
 ## Configuration
 
@@ -199,6 +206,7 @@ invariants = [
     "myapp.invariants:mine_counts_accurate",
 ]
 # postconditions added later via mutation feedback — see Demo Plan
+# postconditions = ["myapp.invariants:win_detected"]
 transitions = "myapp.transitions"  # module with forbid_transition / ignore_transition calls
 seeds = [
     "myapp.seeds:game_seed",
@@ -237,6 +245,7 @@ reveal_action = action(
     },
     pre=lambda db, cell: db.get(Game, cell.game_id).status == 'playing',
     discard=[NoResultFound],
+    # rejects=[ValueError] added after fixing reveal_cell — see Demo Plan
 )
 
 flag_action = action(
@@ -266,11 +275,22 @@ delete_game_action = action(
 
 **Parameter binding:**
 
-- `from_seed(Model)` — picks an ID from seeded entities of that type.
+- `from_seed(Model)` — picks a seeded entity of that type, verifies the
+  row still exists at bind time, and binds its primary key for scalar
+  parameters such as `game_id`. If no live seeded row exists, the step
+  is discarded as a generator miss.
 - `from_entity(Model, where=...)` — draws a whole record from the DB
-  matching the filter. Derived params project fields from the same
-  record, ensuring compound identifiers (row + col) are consistent.
+  matching the filter at bind time. Derived params project fields from
+  the same record, ensuring compound identifiers (row + col) are
+  consistent. If no row matches, the step is discarded.
 - `from_values([...])` — explicit value list for non-schema params.
+
+Bindings may be source-only. In `reveal_action`, `cell` is not passed to
+`reveal_cell`; it is a generated ORM record used by `pre` and by derived
+params. Only names that match the target function signature (`game_id`,
+`row`, `col`) are passed to the function, plus the engine-injected `db`
+session. Source-only bindings are still captured in reproducer metadata
+so the report can say which entity was selected.
 
 Functions are specified by import path string, not direct reference.
 This allows mutation testing to patch at the module level and have
@@ -286,8 +306,11 @@ call. The explorer uses this in two modes:
   loss). This is the primary exploration mode.
 
 - **Unguarded exploration:** ignores `pre` and parameter filters,
-  draws any type-valid arguments from the DB (e.g., flag_cell on a
-  revealed cell). Probes for missing guards.
+  but preserves the action's binding topology. For example, a
+  `from_entity(Cell, where=hidden)` param may draw a revealed cell, and
+  derived `game_id`/`row`/`col` still come from that same cell. This
+  probes missing guards without mostly generating incoherent argument
+  tuples.
 
 Unguarded calls are NOT automatically violations. The explorer only
 reports a finding when an unguarded call causes an invariant failure or
@@ -320,7 +343,9 @@ Each action declares two exception lists:
 - `rejects=[ValueError, PermissionError]` — exceptions that count as
   valid guards during unguarded exploration. If the function raises a
   `rejects` exception when called with invalid inputs, that's the
-  function correctly enforcing its own preconditions. Silently skipped.
+  function correctly enforcing its own preconditions. Silently skipped
+  in unguarded mode. In guarded mode, the same exception is a finding,
+  because the action model declared the call valid.
 
 Any exception NOT on either list is reported as an exploration finding.
 There are no generic discard/reject rules — each action declares its
@@ -347,19 +372,29 @@ with engine.connect() as conn:
             seq_sp = conn.begin_nested()  # sequence savepoint → restores seed
             session = Session(bind=conn)
             session.commit = session.flush  # intercept commit
-            for action_call in sequence:
-                # action_call holds scalar IDs/values; entities are
-                # rehydrated against the current session before calling
+            for planned_step in sequence:
                 step_sp = conn.begin_nested()
                 try:
-                    args = rehydrate(session, action_call)  # load ORM objects from PKs
-                    result = call_action(session, args)
+                    action_call = bind_args(session, planned_step)
+                    # bind_args resolves from_seed/from_entity against
+                    # the current DB state, then freezes scalar values
+                    # for reporting and shrinking.
+                    result = call_action(session, action_call)
                     session.flush()  # flush inside try — savepoint still active
-                except DiscardOrReject:
+                except Discard:
                     step_sp.rollback()
                     session.close()
                     session = Session(bind=conn)
                     session.commit = session.flush
+                    continue
+                except Reject:
+                    step_sp.rollback()
+                    session.close()
+                    session = Session(bind=conn)
+                    session.commit = session.flush
+                    if planned_step.mode == "unguarded":
+                        continue
+                    report_finding(...)  # guarded call was declared valid
                     continue
                 except Exception:
                     step_sp.rollback()
@@ -369,7 +404,9 @@ with engine.connect() as conn:
                     report_finding(...)
                     continue
                 step_sp.commit()  # release only after call + flush succeeded
-                snapshot_and_check(session)
+                if snapshot_and_check(session).violated:
+                    shrink_and_record(...)
+                    break  # abandon this sequence; next one starts from seed
             seq_sp.rollback()  # restore seed state for next sequence
             session.close()
 ```
@@ -387,7 +424,13 @@ with engine.connect() as conn:
   their perspective; changes are flushed to the DB but the sequence
   savepoint is never released.
 - Invariant checks see flushed state after each successful step.
+- After any violation, the current sequence is abandoned and shrunk from
+  the original seed state. The engine does not keep exploring from a
+  known-invalid DB snapshot and cascade noisy follow-on errors.
 - Shrinking replays sequences from the same seed state.
+- Reproducers store scalar IDs/values, but argument binding happens just
+  before each step so destructive actions don't leave later calls with
+  stale ORM objects or deleted seed IDs.
 
 **Limitations of direct mode:**
 
@@ -542,8 +585,8 @@ joins across relationships, and indirect dependencies.
 2. For each step, pick an action and generate arguments:
    a. **Guarded** (70% of budget): respect the action's `pre` and
       parameter filters. Models valid user workflows.
-   b. **Unguarded** (30% of budget): ignore `pre`, draw any type-valid
-      arguments from the DB. Probes for missing guards.
+   b. **Unguarded** (30% of budget): ignore `pre` and parameter filters,
+      but preserve binding topology. Probes for missing guards.
 3. Snapshot tracked column values (before state).
 4. Create a per-step savepoint (protects against dirty ORM state from
    failed calls).
@@ -553,18 +596,24 @@ joins across relationships, and indirect dependencies.
    b. If the call is **unguarded** and raises an exception on the
       action's `rejects` list, roll back the per-step savepoint and
       skip (function correctly rejected invalid input).
-   c. If the call raises an undeclared exception, roll back the
-      per-step savepoint and report as an exploration finding.
+   c. If a guarded call raises a `rejects` exception, or any call raises
+      an undeclared exception, roll back the per-step savepoint and
+      report as an exploration finding.
    d. Otherwise, the call succeeded — flush the session.
 6. Snapshot tracked column values again (after state).
-7. Diff before/after → record state transitions.
+7. Diff before/after → record state transitions and update the empirical
+   action write graph (which actions changed which fields).
 8. Check forbidden transitions against the diff.
 9. Check all invariants (schema-derived + custom) against the DB.
 10. Check postconditions bound to the action that just ran.
-11. If violation → record, shrink, report.
-12. Coverage-directed: bias toward uncovered transitions.
-13. Adversarial: for each invariant, AST-analyze what state would
-    violate it, search for mutation sequences reaching that state.
+11. If violation → record, shrink, report, and abandon the current
+    sequence. The next sequence starts from the seed state.
+12. Coverage-directed: bias future generation toward uncovered
+    transitions and under-exercised action/outcome combinations.
+13. Opportunistic targeting: simple AST comparisons and previous diffs
+    become hints for future values/sequences. The engine does not try to
+    invert arbitrary Python invariants into a complete counterexample
+    generator.
 
 **API mode (CI, thorough):**
 
@@ -596,10 +645,10 @@ Transitions fall into three buckets:
 
 - **Observed** — transitions that were exercised during exploration.
 - **Unseen** — all other valid enum pairs that were not observed and
-  not forbidden. The denominator is every (from, to) pair in the
-  Literal/enum domain, minus forbidden and ignored pairs. Informational, not
-  failures. Some may be impossible by business logic, some may be
-  genuine gaps. The developer decides which matter.
+  not forbidden. The denominator is every non-self (from, to) pair in
+  the Literal/enum domain, minus forbidden and ignored pairs.
+  Informational, not failures. Some may be impossible by business
+  logic, some may be genuine gaps. The developer decides which matter.
 - **Forbidden** — transitions declared via `forbid_transition`. These
   are assertions: if one occurs, it's a violation, not a coverage gap.
   Excluded from the denominator entirely.
@@ -637,6 +686,7 @@ Cell.state transitions (denominator: 6 pairs - 2 forbidden = 4):
 
 Invariant exercise count:
   [schema] fk_integrity              4 scenarios, 0 violations
+  [schema] orphan_detection          1 scenario,  1 VIOLATION
   [custom] revealed_mine_means_lost  3 scenarios, 1 VIOLATION
   [custom] mine_counts_accurate      8 scenarios, 0 violations
 ```
@@ -650,7 +700,8 @@ transitions are excluded from coverage denominators.
 
 ### 7. Mutation Testing
 
-Inject faults into mutation functions to verify invariant quality.
+Inject faults into mutation functions to verify spec quality: schema
+checks, custom invariants, forbidden transitions, and postconditions.
 In-process AST transformation — no file I/O, no process restart.
 
 ```python
@@ -723,7 +774,11 @@ submit_score, assert game state is unchanged."
 Stipulate replaces the scenario-writing with declared outcome domains.
 The developer declares what outcomes an external call can produce.
 The explorer mocks the call and exercises every outcome against every
-reachable state, checking invariants after each.
+state it can reach under the current actions and seeds, checking
+invariants after outcomes that return normally and reporting uncaught
+declared exceptions as covered exception outcomes. The cross-product
+report shows which state × outcome combinations were reached and which
+remain unseen.
 
 ```python
 from stipulate import external
@@ -772,9 +827,13 @@ During exploration:
    DB invariants are NOT checked on the rolled-back state — the
    mutation's partial writes are discarded. The finding is the
    missing error handling itself, not the DB state it left behind.
-4. Checks all invariants after each outcome.
-5. Cross-product: if the game is in 4 possible states × 4 leaderboard
-   outcomes = 16 combinations, all explored automatically.
+4. Checks all invariants after each outcome that returns normally.
+   Uncaught exception outcomes are already reported as findings and have
+   no rolled-forward DB state to check.
+5. Cross-product: if exploration reaches games in 4 statuses and
+   `post_score` has 4 declared outcomes, there are 16 reachable
+   state/outcome combinations to exercise. If only 2 statuses are
+   reached, the report shows the other combinations as unseen.
 
 Coverage reports include external outcome coverage:
 
@@ -804,8 +863,8 @@ Schemas and code evolve. Stipulate detects when changes create gaps:
 
 - **New enum values** — "Literal value `'paused'` added to Game.status.
   No transitions to/from `'paused'` have been tested."
-- **Uncovered mutations** — "Mutation `reset_game` is registered but
-  not reached by any invariant's dependency graph."
+- **Unreached actions** — "Action `reset_game_action` is registered but
+  never bound or executed under current seeds/preconditions."
 - **Broken invariant references** — "Invariant `revealed_mine_means_lost`
   references `Cell.state`, which was renamed to `Cell.display_state`."
 - **New FK relationships** — "New FK `Game.player_id → Player.id`
@@ -816,9 +875,14 @@ Schemas and code evolve. Stipulate detects when changes create gaps:
 ```python
 # conftest.py — after strengthening invariants via mutation feedback
 from stipulate.pytest import create_explorer
+from myapp.models import Game, Cell
 from myapp.actions import (
     reveal_action, flag_action, check_win_action, delete_game_action
 )
+from myapp.invariants import (
+    revealed_mine_means_lost, mine_counts_accurate, win_detected
+)
+import myapp.transitions  # registers forbid_transition / ignore_transition calls
 
 @pytest.fixture
 def explorer(test_db):
@@ -1006,7 +1070,7 @@ Transition coverage (excluding forbidden + ignored):
 ```
 
 Three missing guards (check_win ignores loss, flag_cell accepts revealed
-cells, reveal_cell accepts won/lost games), one structural bug, zero
+cells, reveal_cell accepts terminal games), one structural bug, zero
 test scenarios.
 
 ### Wow 2: "Mutation testing shows what your invariants miss"
@@ -1057,7 +1121,7 @@ verify invariants, measure coverage, mutation-test the specs.
 |---------|---------------|-------------------|
 | State space | Signal domains (bool, enum) | Column types (Literal, FK, bool) |
 | Transitions | Signal value changes | Mutation calls |
-| Dependency graph | Signal → derived → effect | Mutation → field writes → invariant reads |
+| Dependency graph | Signal → derived → effect | Observed action → field writes; optional invariant reads |
 | Assertions | assertAlways, assertAfter | @invariant, forbid_transition |
 | Exploration | Backward cone enumeration | Mutation sequence generation |
 | Coverage | Toggle, transition, cross | Observed / unseen / forbidden |
@@ -1113,9 +1177,9 @@ verify invariants, measure coverage, mutation-test the specs.
 - **External service verification** — explores YOUR handling of declared
   outcome domains (success, failure, timeout, etc.), not the external
   service itself. Does not replay real traffic or test real endpoints
-- **Replace all tests** — regression tests from production incidents
-  still need manual invariants; visual tests, performance tests, and
-  browser-level E2E tests are out of scope
+- **Replace all tests** — production incidents may still need explicit
+  regression tests or newly declared invariants; visual tests,
+  performance tests, and browser-level E2E tests are out of scope
 - **Work with untyped code** — requires SQLModel type annotations.
   No types = no state space = no exploration
 - **Infer business logic** — domain-specific rules must be declared by
@@ -1147,7 +1211,8 @@ Not v1. But it's the strategic path to making invariant authoring cheap.
 Before treating Stipulate as coherent, the repo should satisfy:
 
 - `stipulate explore` with business invariants + forbidden transitions
-  finds the check_win bug and the flag_cell missing guard
+  finds the check_win bug, the flag_cell missing guard, and the
+  reveal_cell terminal-state guard
 - `stipulate explore` with schema checks finds the orphan/FK bug
 - `stipulate mutate` reports survived mutants with actionable suggestions
 - Seed overrides produce a valid 3x3 Minesweeper board
