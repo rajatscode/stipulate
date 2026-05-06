@@ -13,6 +13,7 @@ from stipulate import (
     create_api_checker,
     detect_drift,
     external,
+    forbid_transition,
     from_seed,
     from_values,
     infer_invariant_reads,
@@ -23,6 +24,7 @@ from stipulate import (
 from stipulate.config import load_config
 from stipulate.core.external import external_case_sets
 from stipulate.core.seed import seed_database
+from stipulate.core.transitions import clear_transition_rules
 from stipulate.mutate.runner import Mutant, MutantResult, MutationResult
 
 
@@ -84,6 +86,18 @@ def set_score_status(game_id: str, status: str, db: Session):
 def bump_score(game_id: str, db: Session):
     game = db.get(ScoreGame, game_id)
     game.score += 1
+    db.commit()
+
+
+def lose_score_game(game_id: str, db: Session):
+    game = db.get(ScoreGame, game_id)
+    game.status = "lost"
+    db.commit()
+
+
+def win_score_game(game_id: str, db: Session):
+    game = db.get(ScoreGame, game_id)
+    game.status = "won"
     db.commit()
 
 
@@ -219,6 +233,36 @@ def test_mutation_report_suggests_how_to_kill_survivors():
 
     assert "SURVIVED skip assignment in demo()" in report
     assert "Suggest: add an invariant or action postcondition" in report
+
+
+def test_hypothesis_optimizer_finds_and_shrinks_stateful_sequences():
+    clear_transition_rules()
+    try:
+        forbid_transition(ScoreGame.status, from_="lost", to="won")
+        SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+        with Session(engine) as db:
+            result = Explorer(
+                models=[ScoreGame],
+                actions=[
+                    action(fn=lose_score_game, params={"game_id": from_seed(ScoreGame)}),
+                    action(fn=win_score_game, params={"game_id": from_seed(ScoreGame)}),
+                ],
+                seeds=[score_game_seed],
+                db=db,
+                budget=80,
+                max_depth=2,
+                optimizer="hypothesis",
+            ).run()
+    finally:
+        clear_transition_rules()
+
+    assert result.optimizer == "hypothesis"
+    assert result.optimizer_examples > 0
+    violation = next(v for v in result.violations if v.kind == "forbidden")
+    assert violation.sequence == (
+        "lose_score_game(game_id='s1')",
+        "win_score_game(game_id='s1')",
+    )
 
 
 def test_api_checker_marks_postconditions_skipped_and_checks_invariants():
@@ -368,6 +412,7 @@ seeds = ["sample_app:thing_seed"]
 budget = 12
 max_depth = 2
 guarded_ratio = 0.8
+optimizer = "hypothesis"
 api_generator = "schemathesis"
 """
     )
@@ -380,4 +425,5 @@ api_generator = "schemathesis"
     assert config.budget == 12
     assert config.max_depth == 2
     assert config.guarded_ratio == 0.8
+    assert config.optimizer == "hypothesis"
     assert config.api_generator == "schemathesis"

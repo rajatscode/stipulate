@@ -34,6 +34,7 @@ class ExplorerConfig:
     unguarded: bool = True
     schema_checks: bool = True
     guarded_ratio: float = 0.7
+    optimizer: str = "deterministic"
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,20 @@ class StepRecord:
     call: BoundCall
     external_cases: tuple[ExternalCase, ...]
     label: str
+
+
+@dataclass(frozen=True)
+class PlanStep:
+    action_index: int
+    mode_index: int
+    candidate_index: int
+    external_index: int
+
+
+@dataclass(frozen=True)
+class PlanEvaluation:
+    steps: tuple[StepRecord, ...]
+    failure: CheckFailure | None = None
 
 
 class Explorer:
@@ -58,7 +73,12 @@ class Explorer:
         max_violations: int = 50,
         schema_checks: bool = True,
         guarded_ratio: float = 0.7,
+        optimizer: str = "deterministic",
     ) -> None:
+        if optimizer not in {"deterministic", "hypothesis", "hybrid"}:
+            raise ValueError(
+                "optimizer must be one of: deterministic, hypothesis, hybrid"
+            )
         self.models = models
         self.actions = actions
         self.invariants = invariants or []
@@ -71,6 +91,7 @@ class Explorer:
             max_violations=max_violations,
             schema_checks=schema_checks,
             guarded_ratio=guarded_ratio,
+            optimizer=optimizer,
         )
         self._seed_ids: dict[type, set[Any]] = {}
         self._boundary_values: dict[str, tuple[Any, ...]] = {}
@@ -80,6 +101,7 @@ class Explorer:
 
     def run(self) -> ExplorationResult:
         result = ExplorationResult()
+        result.optimizer = self.config.optimizer
         self._seen_violation_keys = set()
         self._boundary_values = infer_boundary_values(
             functions=[*self._boundary_functions(), *self.invariants, *self.postconditions],
@@ -97,7 +119,10 @@ class Explorer:
         original_commit = self.db.commit
         self.db.commit = self.db.flush
         try:
-            self._explore(prefix=(), depth=0, result=result)
+            if self.config.optimizer in {"deterministic", "hybrid"}:
+                self._explore(prefix=(), depth=0, result=result)
+            if self.config.optimizer in {"hypothesis", "hybrid"}:
+                self._hypothesis_explore(result)
         finally:
             self.db.commit = original_commit
 
@@ -138,6 +163,7 @@ class Explorer:
                         max_violations=self.config.max_violations,
                         schema_checks=self.config.schema_checks,
                         guarded_ratio=self.config.guarded_ratio,
+                        optimizer=self.config.optimizer,
                     ).run()
                     mutation_result.results.append(
                         MutantResult(
@@ -203,6 +229,63 @@ class Explorer:
                 external_cases=external_cases,
             )
 
+    def _hypothesis_explore(self, result: ExplorationResult) -> None:
+        if not self.actions or self.config.max_depth <= 0 or self.config.budget <= 0:
+            return
+        from hypothesis import HealthCheck, Phase, find, settings
+        from hypothesis import strategies as st
+        from hypothesis.errors import NoSuchExample
+
+        max_index = max(32, self.config.budget)
+        plan_step = st.builds(
+            PlanStep,
+            action_index=st.integers(min_value=0, max_value=max(0, len(self.actions) - 1)),
+            mode_index=st.integers(min_value=0, max_value=max(0, len(self._modes()) - 1)),
+            candidate_index=st.integers(min_value=0, max_value=max_index),
+            external_index=st.integers(min_value=0, max_value=max_index),
+        )
+        plans = st.lists(plan_step, min_size=1, max_size=self.config.max_depth)
+        while len(result.violations) < self.config.max_violations:
+            remaining = self.config.budget - result.optimizer_examples
+            if remaining <= 0:
+                return
+            attempts = 0
+
+            def predicate(plan: list[PlanStep]) -> bool:
+                nonlocal attempts
+                attempts += 1
+                evaluation = self._evaluate_plan(tuple(plan))
+                if evaluation.failure is None:
+                    return False
+                key = _violation_key(_violation(evaluation.failure, _labels(evaluation.steps)))
+                return key not in self._seen_violation_keys
+
+            try:
+                found = find(
+                    plans,
+                    predicate,
+                    settings=settings(
+                        database=None,
+                        deadline=None,
+                        derandomize=True,
+                        max_examples=max(1, remaining),
+                        phases=(Phase.generate, Phase.shrink),
+                        suppress_health_check=[
+                            HealthCheck.function_scoped_fixture,
+                            HealthCheck.too_slow,
+                        ],
+                    ),
+                )
+            except NoSuchExample:
+                result.optimizer_examples += attempts
+                return
+
+            result.optimizer_examples += attempts
+            evaluation = self._evaluate_plan(tuple(found), result=result)
+            if evaluation.failure is None:
+                return
+            self._record_violation(result, evaluation.failure, evaluation.steps)
+
     def _execute_branch(
         self,
         *,
@@ -212,10 +295,11 @@ class Explorer:
         result: ExplorationResult,
         external_cases: tuple[ExternalCase, ...] = (),
     ) -> None:
-        label = call.label
-        if external_cases:
-            label = f"{label} [{' x '.join(case.label for case in external_cases)}]"
-        step_record = StepRecord(call=call, external_cases=external_cases, label=label)
+        step_record = StepRecord(
+            call=call,
+            external_cases=external_cases,
+            label=_step_label(call, external_cases),
+        )
         steps = (*prefix, step_record)
         before = snapshot(self.db, self.models)
         step = self.db.begin_nested()
@@ -377,6 +461,127 @@ class Explorer:
         if guarded / total < self.config.guarded_ratio:
             return "guarded"
         return "unguarded"
+
+    def _evaluate_plan(
+        self,
+        plan: tuple[PlanStep, ...],
+        *,
+        result: ExplorationResult | None = None,
+    ) -> PlanEvaluation:
+        savepoint = self.db.begin_nested()
+        steps: list[StepRecord] = []
+        try:
+            _restore_rows(self.db, self.models, self._base_rows)
+            for plan_step in plan:
+                step = self._bind_plan_step(plan_step)
+                if step is None:
+                    continue
+                steps.append(step)
+                failure = self._execute_plan_step(step, result=result)
+                if failure is not None:
+                    return PlanEvaluation(steps=tuple(steps), failure=failure)
+            return PlanEvaluation(steps=tuple(steps))
+        finally:
+            savepoint.rollback()
+            self.db.expire_all()
+
+    def _bind_plan_step(self, plan_step: PlanStep) -> StepRecord | None:
+        modes = self._modes()
+        action = self.actions[plan_step.action_index % len(self.actions)]
+        mode = modes[plan_step.mode_index % len(modes)]
+        calls = action.bind_candidates(
+            self.db,
+            mode,
+            self._seed_ids,
+            self._boundary_values,
+        )
+        if not calls:
+            return None
+        call = calls[plan_step.candidate_index % len(calls)]
+        case_sets = external_case_sets(call.action.fn_obj) or [()]
+        external_cases = case_sets[plan_step.external_index % len(case_sets)]
+        return StepRecord(
+            call=call,
+            external_cases=external_cases,
+            label=_step_label(call, external_cases),
+        )
+
+    def _execute_plan_step(
+        self,
+        step: StepRecord,
+        *,
+        result: ExplorationResult | None = None,
+    ) -> CheckFailure | None:
+        before = snapshot(self.db, self.models)
+        savepoint = self.db.begin_nested()
+        if result is not None:
+            action_name = step.call.action.name or "action"
+            result.steps_executed += 1
+            result.actions_executed[action_name] = result.actions_executed.get(action_name, 0) + 1
+            result.mode_coverage[step.call.mode] = result.mode_coverage.get(step.call.mode, 0) + 1
+        try:
+            with external_override(step.external_cases):
+                step.call.action.invoke(self.db, step.call)
+                external_calls = current_external_calls()
+            self.db.flush()
+        except Discard:
+            savepoint.rollback()
+            self.db.expire_all()
+            return None
+        except Reject as exc:
+            savepoint.rollback()
+            self.db.expire_all()
+            if step.call.mode == "unguarded":
+                return None
+            return CheckFailure(
+                kind="reject",
+                name=step.call.action.name or "action",
+                message=f"guarded call rejected valid input: {exc}",
+            )
+        except Exception as exc:
+            savepoint.rollback()
+            self.db.expire_all()
+            failed_external = declared_exception(step.external_cases, exc)
+            if failed_external is not None:
+                if result is not None:
+                    self._record_external_case(result, failed_external)
+                    self._record_external_cross(result, before, failed_external)
+                return CheckFailure(
+                    kind="external",
+                    name=failed_external.name,
+                    message=(
+                        f"{failed_external.name}.{failed_external.outcome} propagated "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    details={
+                        "external": failed_external.name,
+                        "outcome": failed_external.outcome,
+                        "exception": type(exc).__name__,
+                    },
+                )
+            return CheckFailure(
+                kind="exception",
+                name=step.call.action.name or "action",
+                message=f"{type(exc).__name__}: {exc}",
+            )
+
+        if result is not None:
+            for called_case in external_calls:
+                self._record_external_case(result, called_case)
+                self._record_external_cross(result, before, called_case)
+        after = snapshot(self.db, self.models)
+        events = diff_snapshots(before, after)
+        if result is not None:
+            result.transitions.extend(events)
+            self._record_action_writes(result, step.call.action.name or "action", events)
+        failures = self._checks(events=events, call=step.call, result=result)
+        if failures:
+            savepoint.rollback()
+            self.db.expire_all()
+            return failures[0]
+        savepoint.commit()
+        self.db.expire_all()
+        return None
 
     def _record_violation(
         self,
@@ -549,6 +754,13 @@ def _violation(
         original_sequence=original_sequence,
         shrunk=shrunk,
     )
+
+
+def _step_label(call: BoundCall, external_cases: tuple[ExternalCase, ...]) -> str:
+    label = call.label
+    if external_cases:
+        label = f"{label} [{' x '.join(case.label for case in external_cases)}]"
+    return label
 
 
 def _labels(steps: tuple[StepRecord, ...] | list[StepRecord]) -> tuple[str, ...]:

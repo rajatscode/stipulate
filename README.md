@@ -27,7 +27,9 @@ hook for custom clients. The direct explorer also includes seed-based replay
 metadata, greedy sequence shrinking, opportunistic boundary-value inference,
 coverage-biased scheduling, external state/outcome cross coverage, an
 empirical action write graph, and opt-in incremental invariant checking via
-`@invariant(reads=[...])`.
+`@invariant(reads=[...])`. For harder state spaces, direct mode can also
+use a Hypothesis-backed sequence optimizer with native example shrinking via
+`optimizer = "hypothesis"` or `stipulate explore --optimizer hypothesis`.
 
 ## Development
 

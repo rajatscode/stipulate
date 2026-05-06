@@ -12,6 +12,7 @@ license = "MIT"
 dependencies = [
     "sqlmodel>=0.0.16",
     "sqlalchemy>=2.0",
+    "hypothesis>=6.108",
 ]
 
 [project.optional-dependencies]

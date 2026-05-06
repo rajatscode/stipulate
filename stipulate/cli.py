@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from typing import Any
 
 from stipulate.config import (
@@ -20,6 +21,11 @@ def main(argv: list[str] | None = None) -> int:
 
     explore = subcommands.add_parser("explore")
     explore.add_argument("--db", help="Import path for a DB session factory.")
+    explore.add_argument(
+        "--optimizer",
+        choices=("deterministic", "hypothesis", "hybrid"),
+        help="Direct-mode sequence optimizer. Defaults to [tool.stipulate].optimizer.",
+    )
 
     mutate = subcommands.add_parser("mutate")
     mutate.add_argument("--db", help="Import path for a DB session factory.")
@@ -44,7 +50,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "explore":
         with open_configured_db(config, args.db) as db:
-            result = config.create_explorer(db).run()
+            explorer = config.create_explorer(db)
+            if args.optimizer is not None:
+                explorer.config = replace(explorer.config, optimizer=args.optimizer)
+            result = explorer.run()
         _print_explore_result(result)
         return 1 if result.violations else 0
 
@@ -112,6 +121,8 @@ def _create_api_explorer(
 
 def _print_explore_result(result: Any) -> None:
     print(f"steps: {result.steps_executed}")
+    if result.optimizer_examples:
+        print(f"optimizer examples: {result.optimizer_examples}")
     print(f"violations: {len(result.violations)}")
     for violation in result.violations:
         sequence = " -> ".join(violation.sequence)

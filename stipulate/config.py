@@ -31,6 +31,7 @@ class StipulateConfig:
     budget: int = 500
     max_depth: int = 3
     guarded_ratio: float = 0.7
+    optimizer: str = "deterministic"
 
     def create_explorer(self, db: Any) -> Explorer:
         return Explorer(
@@ -43,6 +44,7 @@ class StipulateConfig:
             budget=self.budget,
             max_depth=self.max_depth,
             guarded_ratio=self.guarded_ratio,
+            optimizer=self.optimizer,
         )
 
     def create_api_explorer(self, db: Any, *, client: Any = None) -> ApiExplorer:
@@ -96,6 +98,7 @@ def load_config(path: str | Path = "pyproject.toml") -> StipulateConfig:
         budget=int(raw.get("budget", 500)),
         max_depth=int(raw.get("max_depth", 3)),
         guarded_ratio=float(raw.get("guarded_ratio", 0.7)),
+        optimizer=raw.get("optimizer", "deterministic"),
     )
 
 

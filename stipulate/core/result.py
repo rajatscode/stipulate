@@ -39,6 +39,8 @@ class ExplorationResult:
     mode_coverage: dict[str, int] = field(default_factory=dict)
     invariant_coverage: dict[str, int] = field(default_factory=dict)
     boundary_values: dict[str, list[Any]] = field(default_factory=dict)
+    optimizer: str = "deterministic"
+    optimizer_examples: int = 0
     actions_executed: dict[str, int] = field(default_factory=dict)
     action_writes: dict[str, dict[str, int]] = field(default_factory=dict)
     transitions: list[TransitionEvent] = field(default_factory=list)
