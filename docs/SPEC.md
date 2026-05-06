@@ -347,14 +347,18 @@ with engine.connect() as conn:
             seq_sp = conn.begin_nested()  # sequence savepoint → restores seed
             session = Session(bind=conn)
             session.commit = session.flush  # intercept commit
-            for action_call in sequence:  # action_call holds scalar IDs/values, not ORM objects
-                step_sp = conn.begin_nested()  # step savepoint → protects against failed calls
+            for action_call in sequence:
+                # action_call holds scalar IDs/values; entities are
+                # rehydrated against the current session before calling
+                step_sp = conn.begin_nested()
                 try:
-                    result = call_action(session, action_call)
+                    args = rehydrate(session, action_call)  # load ORM objects from PKs
+                    result = call_action(session, args)
+                    session.flush()  # flush inside try — savepoint still active
                 except DiscardOrReject:
                     step_sp.rollback()
                     session.close()
-                    session = Session(bind=conn)  # fresh session, clean identity map
+                    session = Session(bind=conn)
                     session.commit = session.flush
                     continue
                 except Exception:
@@ -364,8 +368,7 @@ with engine.connect() as conn:
                     session.commit = session.flush
                     report_finding(...)
                     continue
-                session.flush()  # flush while step savepoint is active
-                step_sp.commit()  # release savepoint only after flush succeeds
+                step_sp.commit()  # release only after call + flush succeeded
                 snapshot_and_check(session)
             seq_sp.rollback()  # restore seed state for next sequence
             session.close()
@@ -1002,7 +1005,9 @@ guard) and one structural bug, zero test scenarios.
 
 ### Wow 2: "Mutation testing shows what your invariants miss"
 
-1. Fix all three bugs.
+1. Fix all three bugs (add guard to flag_cell that raises ValueError,
+   add loss-state check to check_win, add cascade delete to
+   delete_game). Update flag_action to add `rejects=[ValueError]`.
 2. Run `stipulate mutate`.
 3. Reports:
 
