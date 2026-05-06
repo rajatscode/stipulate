@@ -7,6 +7,7 @@ from sqlalchemy import String
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from stipulate import (
+    ApiExplorer,
     Explorer,
     action,
     create_api_checker,
@@ -30,6 +31,13 @@ class ScoreGame(SQLModel, table=True):
     score: int = 10
     score_submitted: bool = False
     leaderboard_rank: int | None = None
+
+
+class ScoreEntry(SQLModel, table=True):
+    __tablename__ = "score_entry"
+
+    id: str = Field(primary_key=True)
+    game_id: str = Field(foreign_key="score_game.id")
 
 
 @dataclass(frozen=True)
@@ -134,21 +142,93 @@ def test_api_checker_marks_postconditions_skipped_and_checks_invariants():
     assert any(violation.kind == "custom" for violation in result.violations)
 
 
+def test_api_explorer_drives_openapi_calls_with_seeded_path_values():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+
+    class Response:
+        status_code = 200
+
+    class Client:
+        def __init__(self, db: Session) -> None:
+            self.db = db
+            self.paths: list[str] = []
+
+        def request(self, method: str, path: str, **kwargs):
+            self.paths.append(path)
+            assert method == "post"
+            assert path == "/games/s1/submit"
+            assert kwargs == {}
+            game = self.db.get(ScoreGame, "s1")
+            game.score_submitted = True
+            game.leaderboard_rank = None
+            self.db.commit()
+            return Response()
+
+    openapi = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/games/{game_id}/submit": {
+                "post": {
+                    "parameters": [
+                        {
+                            "name": "game_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+
+    with Session(engine) as db:
+        client = Client(db)
+        result = ApiExplorer(
+            models=[ScoreGame],
+            db=db,
+            client=client,
+            openapi=openapi,
+            invariants=[submitted_scores_have_rank],
+            seeds=[score_game_seed],
+            budget=1,
+        ).run()
+
+    assert client.paths == ["/games/s1/submit"]
+    assert result.postconditions_skipped is True
+    assert result.api_coverage["POST /games/{game_id}/submit"] == 1
+    assert any(violation.kind == "custom" for violation in result.violations)
+
+
+def test_schema_seed_fallback_creates_fk_aware_rows():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+    with Session(engine) as db:
+        seed_ids = seed_database(db, [], [ScoreGame, ScoreEntry])
+        entry = db.exec(select(ScoreEntry)).one()
+
+    assert seed_ids[ScoreGame]
+    assert seed_ids[ScoreEntry]
+    assert entry.game_id == "score_game-seed"
+
+
 def test_drift_detects_new_literal_values_and_broken_invariant_refs():
-    previous = schema_snapshot([ScoreGame])
+    previous = schema_snapshot([ScoreGame, ScoreEntry])
     previous["ScoreGame"]["literals"]["status"] = ["playing", "won"]
+    previous["ScoreEntry"]["foreign_keys"] = []
 
     def broken_invariant(db: Session):
         assert ScoreGame.missing_field is None
 
     issues = detect_drift(
-        models=[ScoreGame],
+        models=[ScoreGame, ScoreEntry],
         invariants=[broken_invariant],
         previous=previous,
     )
 
     assert any(issue.kind == "new_enum_value" and issue.details["value"] == "lost" for issue in issues)
     assert any(issue.kind == "broken_invariant_reference" for issue in issues)
+    assert any(issue.kind == "new_fk" and issue.details["field"] == "game_id" for issue in issues)
 
 
 def test_config_loader_imports_pyproject_entries(tmp_path, monkeypatch):
@@ -188,6 +268,7 @@ invariants = ["sample_app:thing_invariant"]
 seeds = ["sample_app:thing_seed"]
 budget = 12
 max_depth = 2
+api_generator = "schemathesis"
 """
     )
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -198,3 +279,4 @@ max_depth = 2
     assert config.actions[0].name == "finish"
     assert config.budget == 12
     assert config.max_depth == 2
+    assert config.api_generator == "schemathesis"

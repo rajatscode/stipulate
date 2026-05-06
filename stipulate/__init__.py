@@ -7,12 +7,14 @@ from stipulate.core.seed import seed
 from stipulate.core.transitions import forbid_transition, ignore_transition
 from stipulate.drift import detect_drift, schema_snapshot
 from stipulate.explore.engine import Explorer
-from stipulate.integrations.api import create_api_checker
+from stipulate.integrations.api import ApiExplorer, create_api_checker, create_api_explorer
 
 __all__ = [
+    "ApiExplorer",
     "Explorer",
     "action",
     "create_api_checker",
+    "create_api_explorer",
     "detect_drift",
     "external",
     "forbid_transition",

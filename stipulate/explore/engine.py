@@ -68,7 +68,7 @@ class Explorer:
         result = ExplorationResult()
         self._seen_violation_keys = set()
         if not self._seeded:
-            self._seed_ids = seed_database(self.db, self.seeds)
+            self._seed_ids = seed_database(self.db, self.seeds, self.models)
             self.db.flush()
             self._seeded = True
 

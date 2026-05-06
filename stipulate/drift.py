@@ -23,6 +23,7 @@ def schema_snapshot(models: list[type]) -> dict[str, Any]:
         columns = {column.key for column in model.__table__.columns}
         snapshot[model.__name__] = {
             "fields": sorted(set(model_fields(model)) | columns),
+            "foreign_keys": sorted(_foreign_keys(model)),
             "literals": {
                 name: list(values)
                 for name, values in sorted(literal_fields(model).items())
@@ -77,6 +78,16 @@ def _detect_schema_drift(previous: dict[str, Any], current: dict[str, Any]) -> l
                         details={"model": model_name, "field": field_name, "value": value},
                     )
                 )
+        old_fks = set(old_info.get("foreign_keys", []))
+        for fk in sorted(set(current_info.get("foreign_keys", [])) - old_fks):
+            field_name, target = fk.split("->", 1)
+            issues.append(
+                DriftIssue(
+                    kind="new_fk",
+                    message=f"New FK {model_name}.{field_name} -> {target} detected.",
+                    details={"model": model_name, "field": field_name, "target": target},
+                )
+            )
         removed_fields = set(old_info.get("fields", [])) - set(current_info.get("fields", []))
         for field_name in sorted(removed_fields):
             issues.append(
@@ -155,3 +166,11 @@ def _dedupe(issues: list[DriftIssue]) -> list[DriftIssue]:
         seen.add(key)
         unique.append(issue)
     return unique
+
+
+def _foreign_keys(model: type) -> list[str]:
+    keys: list[str] = []
+    for column in model.__table__.columns:
+        for fk in column.foreign_keys:
+            keys.append(f"{column.key}->{fk.column.table.name}.{fk.column.key}")
+    return keys

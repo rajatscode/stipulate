@@ -20,8 +20,9 @@ This repository is in early implementation. The current implementation covers
 direct-mode exploration for SQLModel apps, action binding, seed helpers,
 schema-derived checks, forbidden transitions, custom invariants, action
 postconditions, transition coverage, external outcome mocking, drift detection,
-basic mutation reporting, config loading, a CLI, and an API-mode invariant
-checker hook.
+basic mutation reporting, config loading, a CLI, OpenAPI-driven API mode,
+optional Schemathesis API case generation, and an API-mode invariant checker
+hook for custom clients.
 
 ## Development
 
@@ -29,6 +30,14 @@ checker hook.
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[test]'
 .venv/bin/pytest
+```
+
+API-mode extras are optional:
+
+```bash
+.venv/bin/python -m pip install -e '.[api,test]'
+stipulate api --app myapp.main:app --db myapp.tests:session_factory
+stipulate api --generator schemathesis --app myapp.main:app --db myapp.tests:session_factory
 ```
 
 ## License

@@ -9,9 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from stipulate.core.utils import import_object
+from stipulate.core.utils import call_with_supported_kwargs, import_object
 from stipulate.drift import detect_drift, schema_snapshot
 from stipulate.explore.engine import Explorer
+from stipulate.integrations.api import ApiExplorer
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,10 @@ class StipulateConfig:
     seeds: list[Any]
     transitions: str | None = None
     db: str | None = None
+    app: str | None = None
+    api_client: str | None = None
+    api_generator: str = "openapi"
+    openapi: str | None = None
     budget: int = 500
     max_depth: int = 3
 
@@ -36,6 +41,29 @@ class StipulateConfig:
             db=db,
             budget=self.budget,
             max_depth=self.max_depth,
+        )
+
+    def create_api_explorer(self, db: Any, *, client: Any = None) -> ApiExplorer:
+        app = import_object(self.app) if self.app else None
+        openapi = import_object(self.openapi) if self.openapi else None
+        api_client = client
+        if api_client is None and self.api_client:
+            factory = import_object(self.api_client)
+            api_client = (
+                call_with_supported_kwargs(factory, {"db": db})
+                if callable(factory) and not hasattr(factory, "request")
+                else factory
+            )
+        return ApiExplorer(
+            models=self.models,
+            invariants=self.invariants,
+            seeds=self.seeds,
+            db=db,
+            app=app,
+            client=api_client,
+            openapi=openapi,
+            budget=self.budget,
+            generator=self.api_generator,
         )
 
 
@@ -59,6 +87,10 @@ def load_config(path: str | Path = "pyproject.toml") -> StipulateConfig:
         seeds=[import_object(path) for path in raw.get("seeds", [])],
         transitions=transitions,
         db=raw.get("db"),
+        app=raw.get("app"),
+        api_client=raw.get("api_client"),
+        api_generator=raw.get("api_generator", "openapi"),
+        openapi=raw.get("openapi"),
         budget=int(raw.get("budget", 500)),
         max_depth=int(raw.get("max_depth", 3)),
     )
