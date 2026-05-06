@@ -21,14 +21,14 @@ from stipulate import (
     from_values,
     infer_invariant_reads,
     invariant,
+    isolated_transition_rules,
     schema_snapshot,
     seed,
 )
 from stipulate.config import load_config
 from stipulate.core.external import external_case_sets
 from stipulate.core.seed import seed_database
-from stipulate.core.transitions import clear_transition_rules
-from stipulate.mutate.runner import Mutant, MutantResult, MutationResult
+from stipulate.mutate.runner import Mutant, MutantResult, MutationResult, generate_mutants
 from stipulate.report import exploration_to_dict, mutation_to_dict
 
 
@@ -106,6 +106,12 @@ def submit_score(game_id: str, db: Session):
 def set_score_status(game_id: str, status: str, db: Session):
     game = db.get(ScoreGame, game_id)
     game.status = status
+    db.commit()
+
+
+def literal_status_mutation(game_id: str, db: Session):
+    game = db.get(ScoreGame, game_id)
+    game.status = "playing"
     db.commit()
 
 
@@ -344,9 +350,60 @@ def test_mutation_report_suggests_how_to_kill_survivors():
     assert "lifecycle invariant" in as_json["survived"][0]["suggestion"]
 
 
+def test_mutation_strings_use_model_literal_domains_not_demo_defaults():
+    mutants = generate_mutants(
+        literal_status_mutation,
+        string_pool=("playing", "won", "lost"),
+    )
+    descriptions = [mutant.description for mutant in mutants]
+
+    assert "swap 'playing' -> 'won' in literal_status_mutation()" in descriptions
+    assert "swap 'playing' -> 'hidden' in literal_status_mutation()" not in descriptions
+    assert "swap 'playing' -> 'flagged' in literal_status_mutation()" not in descriptions
+
+
+def test_mutation_patches_import_path_actions_without_replacing_action_reference():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+    import_path = f"{__name__}:literal_status_mutation"
+    status_action = action(fn=import_path, params={"game_id": from_seed(ScoreGame)})
+
+    @invariant
+    def never_lost(db: Session):
+        game = db.get(ScoreGame, "s1")
+        assert game.status != "lost"
+
+    with Session(engine) as db:
+        result = Explorer(
+            models=[ScoreGame],
+            actions=[status_action],
+            invariants=[never_lost],
+            seeds=[score_game_seed],
+            db=db,
+            budget=10,
+            max_depth=1,
+        ).mutate()
+
+    assert status_action.fn == import_path
+    assert any(
+        item.mutant.description == "swap 'playing' -> 'lost' in literal_status_mutation()"
+        and item.killed
+        for item in result.results
+    )
+
+
+def test_transition_rules_can_be_context_isolated():
+    from stipulate.core.transitions import transition_rules
+
+    outside = transition_rules()
+    with isolated_transition_rules():
+        forbid_transition(ScoreGame.status, from_="won", to="lost")
+        assert len(transition_rules()) == 1
+
+    assert transition_rules() == outside
+
+
 def test_hypothesis_optimizer_finds_and_shrinks_stateful_sequences():
-    clear_transition_rules()
-    try:
+    with isolated_transition_rules():
         forbid_transition(ScoreGame.status, from_="lost", to="won")
         SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
         with Session(engine) as db:
@@ -362,8 +419,6 @@ def test_hypothesis_optimizer_finds_and_shrinks_stateful_sequences():
                 max_depth=2,
                 optimizer="hypothesis",
             ).run()
-    finally:
-        clear_transition_rules()
 
     assert result.optimizer == "hypothesis"
     assert result.optimizer_examples > 0

@@ -14,9 +14,10 @@ from stipulate import (
     from_entity,
     from_seed,
     invariant,
+    isolated_transition_rules,
     seed,
 )
-from stipulate.core.transitions import clear_transition_rules, ignore_transition
+from stipulate.core.transitions import ignore_transition
 
 
 class Game(SQLModel, table=True):
@@ -143,41 +144,41 @@ def session():
 
 @pytest.fixture
 def demo_actions():
-    clear_transition_rules()
-    forbid_transition(Game.status, from_="lost", to="won")
-    forbid_transition(Game.status, from_="lost", to="playing")
-    forbid_transition(Game.status, from_="won", to="lost")
-    forbid_transition(Game.status, from_="won", to="playing")
-    forbid_transition(Cell.state, from_="revealed", to="flagged")
-    forbid_transition(Cell.state, from_="revealed", to="hidden")
-    ignore_transition(Game.status, from_="lost", to="ready")
-    ignore_transition(Game.status, from_="won", to="ready")
+    with isolated_transition_rules():
+        forbid_transition(Game.status, from_="lost", to="won")
+        forbid_transition(Game.status, from_="lost", to="playing")
+        forbid_transition(Game.status, from_="won", to="lost")
+        forbid_transition(Game.status, from_="won", to="playing")
+        forbid_transition(Cell.state, from_="revealed", to="flagged")
+        forbid_transition(Cell.state, from_="revealed", to="hidden")
+        ignore_transition(Game.status, from_="lost", to="ready")
+        ignore_transition(Game.status, from_="won", to="ready")
 
-    reveal_action = action(
-        fn=reveal_cell,
-        params={
-            "cell": from_entity(Cell, where=lambda cell: cell.state == "hidden"),
-            "game_id": lambda cell: cell.game_id,
-            "row": lambda cell: cell.row,
-            "col": lambda cell: cell.col,
-        },
-        pre=lambda db, cell: db.get(Game, cell.game_id).status == "playing",
-        discard=[NoResultFound],
-    )
-    flag_action = action(
-        fn=flag_cell,
-        params={
-            "cell": from_entity(Cell, where=lambda cell: cell.state == "hidden"),
-            "game_id": lambda cell: cell.game_id,
-            "row": lambda cell: cell.row,
-            "col": lambda cell: cell.col,
-        },
-        pre=lambda db, cell: db.get(Game, cell.game_id).status == "playing",
-        discard=[NoResultFound],
-    )
-    check_win_action = action(fn=check_win, params={"game_id": from_seed(Game)})
-    delete_game_action = action(fn=delete_game, params={"game_id": from_seed(Game)})
-    return [reveal_action, flag_action, check_win_action, delete_game_action]
+        reveal_action = action(
+            fn=reveal_cell,
+            params={
+                "cell": from_entity(Cell, where=lambda cell: cell.state == "hidden"),
+                "game_id": lambda cell: cell.game_id,
+                "row": lambda cell: cell.row,
+                "col": lambda cell: cell.col,
+            },
+            pre=lambda db, cell: db.get(Game, cell.game_id).status == "playing",
+            discard=[NoResultFound],
+        )
+        flag_action = action(
+            fn=flag_cell,
+            params={
+                "cell": from_entity(Cell, where=lambda cell: cell.state == "hidden"),
+                "game_id": lambda cell: cell.game_id,
+                "row": lambda cell: cell.row,
+                "col": lambda cell: cell.col,
+            },
+            pre=lambda db, cell: db.get(Game, cell.game_id).status == "playing",
+            discard=[NoResultFound],
+        )
+        check_win_action = action(fn=check_win, params={"game_id": from_seed(Game)})
+        delete_game_action = action(fn=delete_game, params={"game_id": from_seed(Game)})
+        yield [reveal_action, flag_action, check_win_action, delete_game_action]
 
 
 def test_explorer_finds_demo_bugs(session, demo_actions):

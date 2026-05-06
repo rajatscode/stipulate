@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 from collections import defaultdict
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -21,27 +24,40 @@ class TransitionRule:
         return (self.model, self.field, self.from_, self.to)
 
 
-_RULES: list[TransitionRule] = []
+_DEFAULT_RULES: list[TransitionRule] = []
+_RULES: ContextVar[list[TransitionRule] | None] = ContextVar(
+    "stipulate_transition_rules",
+    default=None,
+)
 
 
 def forbid_transition(field: Any, *, from_: Any, to: Any) -> TransitionRule:
     rule = _rule(field, from_=from_, to=to, kind="forbidden")
-    _RULES.append(rule)
+    _current_rules().append(rule)
     return rule
 
 
 def ignore_transition(field: Any, *, from_: Any, to: Any) -> TransitionRule:
     rule = _rule(field, from_=from_, to=to, kind="ignored")
-    _RULES.append(rule)
+    _current_rules().append(rule)
     return rule
 
 
 def transition_rules() -> list[TransitionRule]:
-    return list(_RULES)
+    return list(_current_rules())
 
 
 def clear_transition_rules() -> None:
-    _RULES.clear()
+    _current_rules().clear()
+
+
+@contextlib.contextmanager
+def isolated_transition_rules() -> Iterator[None]:
+    token = _RULES.set([])
+    try:
+        yield
+    finally:
+        _RULES.reset(token)
 
 
 def snapshot(session: Any, models: list[type]) -> dict[tuple[type, Any], dict[str, Any]]:
@@ -84,7 +100,7 @@ def diff_snapshots(
 
 
 def check_forbidden_transitions(events: list[TransitionEvent]) -> list[CheckFailure]:
-    forbidden = {rule.key: rule for rule in _RULES if rule.kind == "forbidden"}
+    forbidden = {rule.key: rule for rule in transition_rules() if rule.kind == "forbidden"}
     failures: list[CheckFailure] = []
     for event in events:
         key = (event.model, event.field, event.before, event.after)
@@ -116,7 +132,7 @@ def tracked_fields(models: list[type]) -> dict[type, tuple[str, ...]]:
     for model in models:
         fields[model].update(column.key for column in model.__table__.columns)
         fields[model].update(literal_fields(model).keys())
-    for rule in _RULES:
+    for rule in transition_rules():
         fields[rule.model].add(rule.field)
     return {model: tuple(sorted(names)) for model, names in fields.items()}
 
@@ -170,3 +186,10 @@ def _rule(field: Any, *, from_: Any, to: Any, kind: Literal["forbidden", "ignore
     if model is None or name is None:
         raise TypeError("transition field must be a SQLModel instrumented attribute")
     return TransitionRule(model=model, field=name, from_=from_, to=to, kind=kind)
+
+
+def _current_rules() -> list[TransitionRule]:
+    rules = _RULES.get()
+    if rules is not None:
+        return rules
+    return _DEFAULT_RULES

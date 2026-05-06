@@ -11,12 +11,17 @@ from sqlmodel import select
 def import_object(path_or_object: Any) -> Any:
     if not isinstance(path_or_object, str):
         return path_or_object
-    module_name, sep, attr = path_or_object.partition(":")
+    module, attr = import_target(path_or_object)
+    return getattr(module, attr)
+
+
+def import_target(path: str) -> tuple[Any, str]:
+    module_name, sep, attr = path.partition(":")
     if not sep:
-        module_name, _, attr = path_or_object.rpartition(".")
+        module_name, _, attr = path.rpartition(".")
     if not module_name or not attr:
-        raise ValueError(f"Expected import path 'module:object', got {path_or_object!r}")
-    return getattr(importlib.import_module(module_name), attr)
+        raise ValueError(f"Expected import path 'module:object', got {path!r}")
+    return importlib.import_module(module_name), attr
 
 
 def object_name(path_or_object: Any) -> str:

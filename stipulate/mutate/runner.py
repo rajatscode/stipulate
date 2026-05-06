@@ -4,19 +4,9 @@ import ast
 import copy
 import inspect
 import textwrap
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
-
-
-DEFAULT_STRING_POOL = (
-    "ready",
-    "playing",
-    "won",
-    "lost",
-    "hidden",
-    "revealed",
-    "flagged",
-)
 
 
 @dataclass(frozen=True)
@@ -86,7 +76,11 @@ class MutationResult:
         return "\n".join(lines)
 
 
-def generate_mutants(fn: Callable[..., Any]) -> list[Mutant]:
+def generate_mutants(
+    fn: Callable[..., Any],
+    *,
+    string_pool: Iterable[str] | Mapping[str, Iterable[str]] = (),
+) -> list[Mutant]:
     try:
         source = textwrap.dedent(inspect.getsource(fn))
     except (OSError, TypeError):
@@ -96,6 +90,8 @@ def generate_mutants(fn: Callable[..., Any]) -> list[Mutant]:
     if function is None:
         return []
 
+    strings = _string_pool(string_pool)
+    parents = _parent_map(function)
     mutants: list[Mutant] = []
     for index, node in enumerate(ast.walk(function)):
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
@@ -124,8 +120,13 @@ def generate_mutants(fn: Callable[..., Any]) -> list[Mutant]:
                     target_text=_source_segment(source, node.test),
                 )
             )
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            for value in DEFAULT_STRING_POOL:
+        elif (
+            strings
+            and isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and _is_behavioral_string(node, parents)
+        ):
+            for value in _replacement_strings(node.value, strings):
                 if value == node.value:
                     continue
                 mutants.append(
@@ -192,6 +193,44 @@ class _ReplaceNode(ast.NodeTransformer):
 
 def _source_segment(source: str, node: ast.AST) -> str:
     return ast.get_source_segment(source, node) or ""
+
+
+def _parent_map(root: ast.AST) -> dict[int, ast.AST]:
+    return {
+        id(child): node
+        for node in ast.walk(root)
+        for child in ast.iter_child_nodes(node)
+    }
+
+
+def _string_pool(
+    values: Iterable[str] | Mapping[str, Iterable[str]],
+) -> tuple[str, ...] | dict[str, tuple[str, ...]]:
+    if isinstance(values, Mapping):
+        return {
+            key: tuple(dict.fromkeys(items))
+            for key, items in values.items()
+        }
+    return tuple(dict.fromkeys(values))
+
+
+def _replacement_strings(
+    value: str,
+    pool: tuple[str, ...] | dict[str, tuple[str, ...]],
+) -> tuple[str, ...]:
+    if isinstance(pool, dict):
+        return pool.get(value, ())
+    return pool
+
+
+def _is_behavioral_string(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
+    parent = parents.get(id(node))
+    if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.Compare)):
+        return True
+    if isinstance(parent, (ast.List, ast.Tuple, ast.Set)):
+        grandparent = parents.get(id(parent))
+        return isinstance(grandparent, (ast.Assign, ast.AnnAssign, ast.Compare))
+    return False
 
 
 def _suggestion(mutant: Mutant) -> str:

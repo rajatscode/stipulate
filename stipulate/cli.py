@@ -13,6 +13,7 @@ from stipulate.config import (
 )
 from stipulate.core.utils import call_with_supported_kwargs, import_object
 from stipulate.report import drift_to_dict, exploration_to_dict, mutation_to_dict
+from stipulate.report.console import print_explore_result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.optimizer is not None:
                 explorer.config = replace(explorer.config, optimizer=args.optimizer)
             result = explorer.run()
-        _print_json(exploration_to_dict(result)) if args.json else _print_explore_result(result)
+        _print_json(exploration_to_dict(result)) if args.json else print_explore_result(result)
         return 1 if result.violations else 0
 
     if args.command == "mutate":
@@ -91,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.generator,
                 headers,
             ).run()
-        _print_json(exploration_to_dict(result)) if args.json else _print_explore_result(result)
+        _print_json(exploration_to_dict(result)) if args.json else print_explore_result(result)
         return 1 if result.violations else 0
 
     if args.command == "drift":
@@ -154,57 +155,6 @@ def _parse_headers(items: list[str]) -> dict[str, str]:
 
 def _print_json(data: Any) -> None:
     print(json.dumps(data, indent=2, sort_keys=True, default=str))
-
-
-def _print_explore_result(result: Any) -> None:
-    print(f"steps: {result.steps_executed}")
-    if result.optimizer_examples:
-        print(f"optimizer examples: {result.optimizer_examples}")
-    print(f"violations: {len(result.violations)}")
-    for violation in result.violations:
-        sequence = " -> ".join(violation.sequence)
-        print(f"- [{violation.kind}] {violation.name}: {violation.message}")
-        if sequence:
-            print(f"  after: {sequence}")
-        if getattr(violation, "shrunk", False):
-            original = " -> ".join(violation.original_sequence)
-            print(f"  shrunk from: {original}")
-        if getattr(violation, "reproducer", ()):
-            print("  reproducer:")
-            for index, step in enumerate(violation.reproducer, start=1):
-                print(f"    {index}. {_format_reproducer_step(step)}")
-    print("coverage:")
-    print(json.dumps(result.coverage, indent=2, sort_keys=True, default=str))
-    if result.mode_coverage:
-        print("mode coverage:")
-        print(json.dumps(result.mode_coverage, indent=2, sort_keys=True, default=str))
-    if result.invariant_coverage:
-        print("invariant exercise count:")
-        print(json.dumps(result.invariant_coverage, indent=2, sort_keys=True, default=str))
-    if result.action_writes:
-        print("action writes:")
-        print(json.dumps(result.action_writes, indent=2, sort_keys=True, default=str))
-    if result.external_coverage:
-        print("external coverage:")
-        print(json.dumps(result.external_coverage, indent=2, sort_keys=True, default=str))
-    if result.external_cross_coverage:
-        print("external cross coverage:")
-        print(json.dumps(result.external_cross_coverage, indent=2, sort_keys=True, default=str))
-    if result.api_coverage:
-        print("api coverage:")
-        print(json.dumps(result.api_coverage, indent=2, sort_keys=True, default=str))
-    if result.api_status_coverage:
-        print("api status coverage:")
-        print(json.dumps(result.api_status_coverage, indent=2, sort_keys=True, default=str))
-
-
-def _format_reproducer_step(step: dict[str, Any]) -> str:
-    args = ", ".join(f"{key}={value!r}" for key, value in step.get("args", {}).items())
-    prefix = "[unguarded] " if step.get("mode") == "unguarded" else ""
-    suffix = ""
-    if step.get("externals"):
-        suffix = f" [{' x '.join(step['externals'])}]"
-    return f"{prefix}{step.get('action', 'action')}({args}){suffix}"
 
 
 if __name__ == "__main__":

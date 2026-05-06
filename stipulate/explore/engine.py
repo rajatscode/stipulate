@@ -21,7 +21,7 @@ from stipulate.core.transitions import (
     diff_snapshots,
     snapshot,
 )
-from stipulate.core.utils import literal_fields, query_all
+from stipulate.core.utils import import_target, literal_fields, query_all
 from stipulate.explore.boundary import infer_boundary_values
 from stipulate.mutate.runner import MutantResult, MutationResult, generate_mutants
 
@@ -157,13 +157,14 @@ class Explorer:
 
     def mutate(self) -> Any:
         mutation_result = MutationResult()
+        string_pool = _mutation_string_pool(self.models)
         for action in self.actions:
-            original_fn = action.fn
-            for mutant in generate_mutants(action.fn_obj):
-                action.fn = mutant.fn
-                savepoint = self.db.begin_nested()
+            for mutant in generate_mutants(action.fn_obj, string_pool=string_pool):
+                restore_action = _patch_action_function(action, mutant.fn)
+                savepoint = None
                 try:
-                    run_result = Explorer(
+                    savepoint = self.db.begin_nested()
+                    explorer = Explorer(
                         models=self.models,
                         actions=self.actions,
                         invariants=self.invariants,
@@ -176,7 +177,8 @@ class Explorer:
                         schema_checks=self.config.schema_checks,
                         guarded_ratio=self.config.guarded_ratio,
                         optimizer=self.config.optimizer,
-                    ).run()
+                    )
+                    run_result = explorer.run()
                     mutation_result.results.append(
                         MutantResult(
                             mutant=mutant,
@@ -185,9 +187,10 @@ class Explorer:
                         )
                     )
                 finally:
-                    action.fn = original_fn
-                    savepoint.rollback()
-                    self.db.expire_all()
+                    restore_action()
+                    if savepoint is not None:
+                        savepoint.rollback()
+                    _recover_session(self.db)
         return mutation_result
 
     def _explore(
@@ -880,6 +883,41 @@ def _raise_rollback_requested() -> None:
     )
 
 
+def _patch_action_function(action: Action, replacement: Callable[..., Any]) -> Callable[[], None]:
+    original_fn = action.fn
+    if isinstance(original_fn, str):
+        module, attr = import_target(original_fn)
+        original_attr = getattr(module, attr)
+        setattr(module, attr, replacement)
+
+        def restore_import_path() -> None:
+            setattr(module, attr, original_attr)
+
+        return restore_import_path
+
+    action.fn = replacement
+
+    def restore_callable() -> None:
+        action.fn = original_fn
+
+    return restore_callable
+
+
+def _mutation_string_pool(models: list[type]) -> dict[str, tuple[str, ...]]:
+    values: dict[str, list[str]] = {}
+    for model in models:
+        for domain in literal_fields(model).values():
+            strings = tuple(value for value in domain if isinstance(value, str))
+            for value in domain:
+                if not isinstance(value, str):
+                    continue
+                bucket = values.setdefault(value, [])
+                for candidate in strings:
+                    if candidate not in bucket:
+                        bucket.append(candidate)
+    return {value: tuple(candidates) for value, candidates in values.items()}
+
+
 def _recover_session(session: Any) -> None:
     if getattr(session, "is_active", True) is False:
         rollback = _ORIGINAL_ROLLBACKS.get(id(session), getattr(session, "rollback", None))
@@ -888,6 +926,9 @@ def _recover_session(session: Any) -> None:
                 rollback()
             except Exception:
                 pass
+    expunge_all = getattr(session, "expunge_all", None)
+    if callable(expunge_all):
+        expunge_all()
     expire_all = getattr(session, "expire_all", None)
     if callable(expire_all):
         expire_all()
