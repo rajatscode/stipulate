@@ -21,6 +21,7 @@ from stipulate import (
     postcondition,
     seed,
 )
+from stipulate.core.external import external
 from stipulate.core.invariant import check_invariants
 from stipulate.core.schema_check import check_schema
 from stipulate.core.transitions import clear_transition_rules, ignore_transition
@@ -37,6 +38,7 @@ class Game(SQLModel, table=True):
     rows: int = 3
     cols: int = 3
     mine_count: int = 1
+    score_submitted: bool = False
 
 
 class Cell(SQLModel, table=True):
@@ -143,6 +145,41 @@ def delete_game_fixed(game_id: str, db: Session) -> None:
     db.commit()
 
 
+@external(
+    outcomes={
+        "success": {"posted": True, "rank": 42},
+        "timeout": TimeoutError("leaderboard service timeout"),
+        "unavailable": ConnectionError("leaderboard service down"),
+    }
+)
+def post_score(game_id: str, score: int) -> dict[str, Any]:
+    """Post score to external leaderboard service."""
+    return {"posted": True, "rank": 1}
+
+
+def submit_score(game_id: str, db: Session) -> None:
+    game = db.get(Game, game_id)
+    if game is None or game.status != "won":
+        return
+    result = post_score(game_id, 100)
+    if result["posted"]:
+        game.score_submitted = True
+    db.commit()
+
+
+def submit_score_fixed(game_id: str, db: Session) -> None:
+    game = db.get(Game, game_id)
+    if game is None or game.status != "won":
+        return
+    try:
+        result = post_score(game_id, 100)
+    except (TimeoutError, ConnectionError):
+        return
+    if result["posted"]:
+        game.score_submitted = True
+    db.commit()
+
+
 @invariant
 def revealed_mine_means_lost(db: Session) -> None:
     bad = db.exec(
@@ -169,6 +206,17 @@ def mine_counts_accurate(db: Session) -> None:
             )
         ).one()
         assert cell.adjacent_mines == actual
+
+
+@invariant
+def score_only_when_won(db: Session) -> None:
+    bad = db.exec(
+        select(Game).where(
+            Game.score_submitted == True,  # noqa: E712
+            Game.status != "won",
+        )
+    ).all()
+    assert len(bad) == 0, f"Score submitted for non-won games: {bad}"
 
 
 @seed(Game)
@@ -251,7 +299,13 @@ def build_actions(*, fixed: bool = False) -> list[Any]:
         params={"game_id": from_seed(Game)},
         name="delete_game",
     )
-    return [reveal_action, flag_action, check_win_action, delete_game_action]
+    submit_score_fn = submit_score_fixed if fixed else submit_score
+    submit_score_action = action(
+        fn=submit_score_fn,
+        params={"game_id": from_seed(Game)},
+        name="submit_score",
+    )
+    return [reveal_action, flag_action, check_win_action, delete_game_action, submit_score_action]
 
 
 def run_explore(*, budget: int, max_depth: int, optimizer: str, fixed: bool = False) -> Any:
@@ -287,6 +341,14 @@ def validate_demo() -> None:
     )
     assert result.coverage["Game.status"]["denominator"] == 6
     assert result.coverage["Cell.state"]["denominator"] == 4
+
+    # External outcome coverage
+    assert "post_score" in result.external_coverage, "missing external coverage for post_score"
+    assert "success" in result.external_coverage["post_score"]
+    assert any(
+        violation.kind == "external" and violation.name == "post_score"
+        for violation in result.violations
+    ), "expected external violation for unhandled exception"
 
     mutation = run_mutate(budget=60, max_depth=3, optimizer="deterministic", fixed=True)
     assert mutation.score[1] > 0
@@ -330,7 +392,7 @@ def _explorer(
     return Explorer(
         models=[Game, Cell],
         actions=actions,
-        invariants=[revealed_mine_means_lost, mine_counts_accurate],
+        invariants=[revealed_mine_means_lost, mine_counts_accurate, score_only_when_won],
         postconditions=[win_detected],
         seeds=[game_seed, cell_seeds],
         db=db,
@@ -405,6 +467,9 @@ class _DemoHandler(BaseHTTPRequestHandler):
         if path == "/api/delete-game":
             self._json(_perform("delete_game()", lambda db: delete_game("g1", db)))
             return
+        if path == "/api/submit-score":
+            self._json(_perform("submit_score()", lambda db: submit_score("g1", db)))
+            return
 
         parts = [part for part in path.split("/") if part]
         if len(parts) == 4 and parts[:2] == ["api", "reveal"]:
@@ -466,7 +531,7 @@ def _perform(label: str, fn: Any) -> dict[str, Any]:
         events = diff_snapshots(before, after)
         failures = check_forbidden_transitions(events)
         failures.extend(check_schema(db, [Game, Cell]))
-        failures.extend(check_invariants(db, [revealed_mine_means_lost, mine_counts_accurate]))
+        failures.extend(check_invariants(db, [revealed_mine_means_lost, mine_counts_accurate, score_only_when_won]))
         for failure in failures:
             item = _failure_payload(failure, label)
             if item not in _PLAY_FINDINGS:
@@ -487,6 +552,7 @@ def _state_payload() -> dict[str, Any]:
                     "rows": game.rows,
                     "cols": game.cols,
                     "mine_count": game.mine_count,
+                    "score_submitted": game.score_submitted,
                 }
                 if game is not None
                 else None
@@ -547,6 +613,15 @@ def _explore_summary(result: Any) -> dict[str, Any]:
         violations = sum(1 for v in result.violations if v.kind == "invariant" and v.name == name)
         invariant_exercise[name] = {"checked": count, "violations": violations}
 
+    external_coverage: dict[str, Any] = {}
+    for name, counts in result.external_coverage.items():
+        external_coverage[name] = {
+            "outcomes": {outcome: count for outcome, count in sorted(counts.items())},
+        }
+    external_cross: dict[str, Any] = {}
+    for name, counts in result.external_cross_coverage.items():
+        external_cross[name] = {key: count for key, count in sorted(counts.items())}
+
     return {
         "steps": result.steps_executed,
         "violations": [
@@ -564,6 +639,8 @@ def _explore_summary(result: Any) -> dict[str, Any]:
         "action_writes": result.action_writes,
         "transition_coverage": transition_coverage,
         "invariant_exercise": invariant_exercise,
+        "external_coverage": external_coverage,
+        "external_cross_coverage": external_cross,
     }
 
 
@@ -736,6 +813,7 @@ body{
 .badge.schema{background:#fffbeb;color:#92400e}
 .badge.invariant{background:#eff6ff;color:#1e40af}
 .badge.postcondition{background:#f5f3ff;color:#5b21b6}
+.badge.external{background:#fdf4ff;color:#86198f}
 .v-name{font-weight:600;font-size:14px;color:#111827}
 .v-msg{font-size:13px;color:#4b5563;margin-bottom:8px}
 .v-seq{
@@ -829,6 +907,7 @@ body{
       <div>
         <div class="board-status">
           <span class="status-chip" id="gameStatus">loading</span>
+          <span class="status-chip" id="scoreChip" style="display:none">score: pending</span>
           <span class="status-chip" id="orphanChip" style="display:none">orphans: 0</span>
         </div>
         <div class="board" id="board"></div>
@@ -837,6 +916,7 @@ body{
           <button class="btn" id="flagMode">Flag</button>
           <span style="width:6px"></span>
           <button class="btn" onclick="post('/api/check-win')">Check win</button>
+          <button class="btn" onclick="post('/api/submit-score')">Submit score</button>
           <button class="btn danger" onclick="post('/api/delete-game')">Delete game</button>
           <button class="btn" onclick="post('/api/reset')">Reset</button>
         </div>
@@ -934,6 +1014,19 @@ function render(data) {
   var status = data.game ? data.game.status : 'deleted';
   gs.textContent = status;
   gs.className = 'status-chip' + (status === 'lost' || status === 'deleted' ? ' red' : '') + (status === 'won' ? ' green' : '');
+
+  var sc = document.getElementById('scoreChip');
+  if (data.game && data.game.score_submitted) {
+    sc.style.display = '';
+    sc.textContent = 'score: submitted';
+    sc.className = 'status-chip green';
+  } else if (data.game && data.game.status === 'won') {
+    sc.style.display = '';
+    sc.textContent = 'score: pending';
+    sc.className = 'status-chip';
+  } else {
+    sc.style.display = 'none';
+  }
 
   var oc = document.getElementById('orphanChip');
   if (data.orphan_count > 0) {
@@ -1074,6 +1167,32 @@ function renderExploreResults(data) {
       });
       html += '</tbody></table></div>';
     }
+  }
+
+  if (data.external_coverage && Object.keys(data.external_coverage).length > 0) {
+    html += '<div class="panel"><h2>External Outcome Coverage</h2>';
+    for (var extName in data.external_coverage) {
+      var ext = data.external_coverage[extName];
+      html += '<div class="transition-section"><h3>' + esc(extName) + '</h3>';
+      html += '<div class="pair-list">';
+      for (var outcome in ext.outcomes) {
+        var cnt = ext.outcomes[outcome];
+        html += '<div class="pair-row observed">' + esc(outcome) + '<span class="status-label">' + cnt + 'x</span></div>';
+      }
+      html += '</div></div>';
+    }
+    if (data.external_cross_coverage && Object.keys(data.external_cross_coverage).length > 0) {
+      for (var crossName in data.external_cross_coverage) {
+        var cross = data.external_cross_coverage[crossName];
+        html += '<div class="transition-section"><h3>' + esc(crossName) + ' cross coverage (state \u00d7 outcome)</h3>';
+        html += '<div class="pair-list">';
+        for (var key in cross) {
+          html += '<div class="pair-row observed">' + esc(key) + '<span class="status-label">' + cross[key] + 'x</span></div>';
+        }
+        html += '</div></div>';
+      }
+    }
+    html += '</div>';
   }
 
   html += '<div class="panel"><h2>Exploration Details</h2>';
