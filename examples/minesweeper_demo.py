@@ -18,6 +18,7 @@ from stipulate import (
     from_entity,
     from_seed,
     invariant,
+    postcondition,
     seed,
 )
 from stipulate.core.invariant import check_invariants
@@ -306,10 +307,31 @@ def _explorer(
     optimizer: str,
     fixed: bool,
 ) -> Explorer:
+    actions = build_actions(fixed=fixed)
+    check_win_action = next(a for a in actions if a.name == "check_win")
+
+    @postcondition(action=check_win_action)
+    def win_detected(db: Session, game_id: str) -> None:
+        game = db.get(Game, game_id)
+        if game is None or game.status == "lost":
+            return
+        unrevealed = db.exec(
+            select(Cell).where(
+                Cell.game_id == game_id,
+                Cell.is_mine == False,  # noqa: E712
+                Cell.state != "revealed",
+            )
+        ).all()
+        if len(unrevealed) == 0:
+            assert game.status == "won", (
+                f"all non-mine cells revealed but status is {game.status!r}, expected 'won'"
+            )
+
     return Explorer(
         models=[Game, Cell],
-        actions=build_actions(fixed=fixed),
+        actions=actions,
         invariants=[revealed_mine_means_lost, mine_counts_accurate],
+        postconditions=[win_detected],
         seeds=[game_seed, cell_seeds],
         db=db,
         budget=budget,
