@@ -347,7 +347,7 @@ with engine.connect() as conn:
             seq_sp = conn.begin_nested()  # sequence savepoint → restores seed
             session = Session(bind=conn)
             session.commit = session.flush  # intercept commit
-            for action_call in sequence:
+            for action_call in sequence:  # action_call holds scalar IDs/values, not ORM objects
                 step_sp = conn.begin_nested()  # step savepoint → protects against failed calls
                 try:
                     result = call_action(session, action_call)
@@ -364,8 +364,8 @@ with engine.connect() as conn:
                     session.commit = session.flush
                     report_finding(...)
                     continue
-                step_sp.commit()  # success: release savepoint, keep changes
-                session.flush()
+                session.flush()  # flush while step savepoint is active
+                step_sp.commit()  # release savepoint only after flush succeeds
                 snapshot_and_check(session)
             seq_sp.rollback()  # restore seed state for next sequence
             session.close()
@@ -1086,8 +1086,10 @@ verify invariants, measure coverage, mutation-test the specs.
 
 7. **Three-bucket coverage.** Observed, unseen, and forbidden. Forbidden
    transitions are assertions, not coverage gaps. Unseen transitions are
-   informational — the developer decides which matter. Forbidden
-   transitions are excluded from coverage denominators.
+   informational — the developer decides which matter. Ignored
+   transitions (via `ignore_transition`) are excluded from reports
+   entirely to reduce noise. Forbidden and ignored transitions are both
+   excluded from coverage denominators.
 
 8. **The feedback loop is the product.** Explore → find violations →
    fix code → mutate → find weak invariants → strengthen → repeat.
