@@ -29,6 +29,7 @@ class BindContext:
     session: Any
     mode: str
     seed_ids: dict[type, set[Any]]
+    boundary_values: dict[str, tuple[Any, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -102,14 +103,25 @@ class Action:
     def fn_obj(self) -> Callable[..., Any]:
         return import_object(self.fn)
 
-    def bind_candidates(self, session: Any, mode: str, seed_ids: dict[type, set[Any]]) -> list[BoundCall]:
-        context = BindContext(session=session, mode=mode, seed_ids=seed_ids)
+    def bind_candidates(
+        self,
+        session: Any,
+        mode: str,
+        seed_ids: dict[type, set[Any]],
+        boundary_values: dict[str, tuple[Any, ...]] | None = None,
+    ) -> list[BoundCall]:
+        context = BindContext(
+            session=session,
+            mode=mode,
+            seed_ids=seed_ids,
+            boundary_values=boundary_values or {},
+        )
         partials: list[tuple[dict[str, Any], dict[str, Any]]] = [({}, {})]
 
         for name, spec in self.params.items():
             next_partials: list[tuple[dict[str, Any], dict[str, Any]]] = []
             for values, sources in partials:
-                for value in _candidate_values(spec, context, values):
+                for value in _candidate_values(name, spec, context, values):
                     updated = {**values, name: value}
                     updated_sources = sources
                     if isinstance(spec, ParamSource):
@@ -191,12 +203,20 @@ def from_values(values: list[Any] | tuple[Any, ...]) -> ValuesSource:
     return ValuesSource(tuple(values))
 
 
-def _candidate_values(spec: Any, context: BindContext, values: dict[str, Any]) -> list[Any]:
+def _candidate_values(
+    name: str,
+    spec: Any,
+    context: BindContext,
+    values: dict[str, Any],
+) -> list[Any]:
     if isinstance(spec, ParamSource):
-        return spec.candidates(context)
+        candidates = spec.candidates(context)
+        if isinstance(spec, ValuesSource):
+            candidates.extend(context.boundary_values.get(name, ()))
+        return _unique(candidates)
     if callable(spec):
         return [call_with_supported_kwargs(spec, values)]
-    return [spec]
+    return _unique([spec, *context.boundary_values.get(name, ())])
 
 
 def _matches(where: Callable[[Any], Any], model: type, row: Any) -> bool:
@@ -215,3 +235,11 @@ def _report_value(value: Any) -> Any:
     if hasattr(type(value), "__table__"):
         return {primary_key_name(type(value)): primary_key_value(value)}
     return value
+
+
+def _unique(values: list[Any]) -> list[Any]:
+    unique: list[Any] = []
+    for value in values:
+        if value not in unique:
+            unique.append(value)
+    return unique

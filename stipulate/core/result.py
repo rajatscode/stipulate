@@ -15,6 +15,9 @@ class CheckFailure:
 @dataclass(frozen=True)
 class Violation(CheckFailure):
     sequence: tuple[str, ...] = ()
+    reproducer: tuple[dict[str, Any], ...] = ()
+    original_sequence: tuple[str, ...] = ()
+    shrunk: bool = False
 
 
 @dataclass(frozen=True)
@@ -31,8 +34,13 @@ class ExplorationResult:
     violations: list[Violation] = field(default_factory=list)
     coverage: dict[str, Any] = field(default_factory=dict)
     external_coverage: dict[str, dict[str, int]] = field(default_factory=dict)
+    external_cross_coverage: dict[str, dict[str, int]] = field(default_factory=dict)
     api_coverage: dict[str, int] = field(default_factory=dict)
+    mode_coverage: dict[str, int] = field(default_factory=dict)
+    invariant_coverage: dict[str, int] = field(default_factory=dict)
+    boundary_values: dict[str, list[Any]] = field(default_factory=dict)
     actions_executed: dict[str, int] = field(default_factory=dict)
+    action_writes: dict[str, dict[str, int]] = field(default_factory=dict)
     transitions: list[TransitionEvent] = field(default_factory=list)
     steps_executed: int = 0
     postconditions_skipped: bool = False

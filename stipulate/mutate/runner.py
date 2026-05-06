@@ -24,6 +24,8 @@ class Mutant:
     id: str
     description: str
     fn: Callable[..., Any]
+    operator: str = "unknown"
+    target: str = ""
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,7 @@ class MutationResult:
         if self.survived:
             for result in self.survived:
                 lines.append(f"  SURVIVED {result.mutant.description}")
+                lines.append(f"    Suggest: {_suggestion(result.mutant)}")
         else:
             lines.append("  none")
         return "\n".join(lines)
@@ -100,6 +103,8 @@ def generate_mutants(fn: Callable[..., Any]) -> list[Mutant]:
                     replacement=ast.Pass(),
                     mutant_id=f"{fn.__name__}:skip-assign:{index}",
                     description=f"skip assignment in {fn.__name__}()",
+                    operator="skip_assignment",
+                    target_text=_source_segment(source, node),
                 )
             )
         elif isinstance(node, ast.If):
@@ -111,6 +116,8 @@ def generate_mutants(fn: Callable[..., Any]) -> list[Mutant]:
                     replacement=ast.UnaryOp(op=ast.Not(), operand=copy.deepcopy(node.test)),
                     mutant_id=f"{fn.__name__}:flip-if:{index}",
                     description=f"flip if condition in {fn.__name__}()",
+                    operator="flip_condition",
+                    target_text=_source_segment(source, node.test),
                 )
             )
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -127,6 +134,8 @@ def generate_mutants(fn: Callable[..., Any]) -> list[Mutant]:
                         description=(
                             f"swap {node.value!r} -> {value!r} in {fn.__name__}()"
                         ),
+                        operator="swap_constant",
+                        target_text=str(node.value),
                     )
                 )
     return [mutant for mutant in mutants if mutant is not None]
@@ -140,6 +149,8 @@ def _compile_mutant(
     replacement: ast.AST,
     mutant_id: str,
     description: str,
+    operator: str,
+    target_text: str,
 ) -> Mutant | None:
     mutant_tree = copy.deepcopy(tree)
     replacer = _ReplaceNode(target, replacement)
@@ -153,7 +164,13 @@ def _compile_mutant(
     mutant_fn = namespace.get(fn.__name__)
     if not callable(mutant_fn):
         return None
-    return Mutant(id=mutant_id, description=description, fn=mutant_fn)
+    return Mutant(
+        id=mutant_id,
+        description=description,
+        fn=mutant_fn,
+        operator=operator,
+        target=target_text,
+    )
 
 
 class _ReplaceNode(ast.NodeTransformer):
@@ -167,3 +184,24 @@ class _ReplaceNode(ast.NodeTransformer):
             self._replaced = True
             return copy.deepcopy(self._replacement)
         return super().generic_visit(node)
+
+
+def _source_segment(source: str, node: ast.AST) -> str:
+    return ast.get_source_segment(source, node) or ""
+
+
+def _suggestion(mutant: Mutant) -> str:
+    if mutant.operator == "skip_assignment":
+        target = f" `{mutant.target}`" if mutant.target else ""
+        return (
+            f"add an invariant or action postcondition that observes assignment{target}."
+        )
+    if mutant.operator == "swap_constant":
+        return (
+            f"assert the allowed lifecycle state around {mutant.target!r}, "
+            "or forbid the invalid transition explicitly."
+        )
+    if mutant.operator == "flip_condition":
+        target = f" `{mutant.target}`" if mutant.target else ""
+        return f"cover both sides of condition{target} with an invariant or postcondition."
+    return "add a business invariant that distinguishes this behavior from the original."

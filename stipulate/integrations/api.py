@@ -49,7 +49,14 @@ class ApiModeChecker:
         failures = check_forbidden_transitions(events)
         if self.schema_checks:
             failures.extend(check_schema(self.db, self.models))
-        failures.extend(check_invariants(self.db, self.invariants))
+        failures.extend(
+            check_invariants(
+                self.db,
+                self.invariants,
+                events=events,
+                exercised=result.invariant_coverage,
+            )
+        )
         result.violations.extend(
             Violation(
                 kind=failure.kind,
@@ -137,6 +144,8 @@ class ApiExplorer:
             checked = checker.after_call(before, sequence=(request.label,))
             result.transitions.extend(checked.transitions)
             result.violations.extend(checked.violations)
+            for name, count in checked.invariant_coverage.items():
+                result.invariant_coverage[name] = result.invariant_coverage.get(name, 0) + count
 
         result.coverage = coverage_report(self.models, result.transitions)
         return result

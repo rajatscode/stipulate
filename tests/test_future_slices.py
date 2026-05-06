@@ -14,6 +14,8 @@ from stipulate import (
     detect_drift,
     external,
     from_seed,
+    from_values,
+    infer_invariant_reads,
     invariant,
     schema_snapshot,
     seed,
@@ -21,6 +23,7 @@ from stipulate import (
 from stipulate.config import load_config
 from stipulate.core.external import external_case_sets
 from stipulate.core.seed import seed_database
+from stipulate.mutate.runner import Mutant, MutantResult, MutationResult
 
 
 class ScoreGame(SQLModel, table=True):
@@ -72,6 +75,18 @@ def submit_score(game_id: str, db: Session):
     db.commit()
 
 
+def set_score_status(game_id: str, status: str, db: Session):
+    game = db.get(ScoreGame, game_id)
+    game.status = status
+    db.commit()
+
+
+def bump_score(game_id: str, db: Session):
+    game = db.get(ScoreGame, game_id)
+    game.score += 1
+    db.commit()
+
+
 def direct_external_pair(game_id: str):
     post_score(game_id, 10)
     notify_score(game_id)
@@ -110,6 +125,10 @@ def test_external_outcomes_are_exercised_and_report_uncaught_exception():
     assert result.external_coverage["post_score"]["success"] >= 1
     assert result.external_coverage["post_score"]["duplicate"] >= 1
     assert any(
+        "ScoreGame('s1').status='won' + success" in key
+        for key in result.external_cross_coverage["post_score"]
+    )
+    assert any(
         violation.kind == "external" and violation.details["outcome"] == "timeout"
         for violation in result.violations
     )
@@ -120,6 +139,86 @@ def test_external_case_sets_cross_product_declared_outcomes():
 
     assert len(cases) == 6
     assert all(len(case_set) == 2 for case_set in cases)
+
+
+def test_boundary_inference_supplements_action_values():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+    with Session(engine) as db:
+        result = Explorer(
+            models=[ScoreGame],
+            actions=[
+                action(
+                    fn=set_score_status,
+                    params={
+                        "game_id": from_seed(ScoreGame),
+                        "status": from_values([]),
+                    },
+                )
+            ],
+            seeds=[score_game_seed],
+            db=db,
+            budget=10,
+            max_depth=1,
+        ).run()
+
+    assert "lost" in result.boundary_values["status"]
+    assert any(event.field == "status" and event.after == "lost" for event in result.transitions)
+    assert result.action_writes["set_score_status"]["ScoreGame.status"] >= 1
+
+
+def test_invariant_reads_skip_unrelated_changes():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+    calls = {"status": 0, "global": 0}
+
+    @invariant(reads=["ScoreGame.status"])
+    def status_only(db: Session):
+        calls["status"] += 1
+
+    @invariant
+    def global_check(db: Session):
+        calls["global"] += 1
+
+    with Session(engine) as db:
+        result = Explorer(
+            models=[ScoreGame],
+            actions=[action(fn=bump_score, params={"game_id": from_seed(ScoreGame)})],
+            invariants=[status_only, global_check],
+            seeds=[score_game_seed],
+            db=db,
+            budget=1,
+            max_depth=1,
+        ).run()
+
+    assert calls["status"] == 0
+    assert calls["global"] == 1
+    assert result.invariant_coverage == {"global_check": 1}
+
+
+def test_invariant_read_inference_helper_extracts_simple_model_fields():
+    def sample(db: Session):
+        assert ScoreGame.status != "lost"
+
+    assert infer_invariant_reads(sample, [ScoreGame]) == ("ScoreGame.status",)
+
+
+def test_mutation_report_suggests_how_to_kill_survivors():
+    report = MutationResult(
+        results=[
+            MutantResult(
+                mutant=Mutant(
+                    id="demo",
+                    description="skip assignment in demo()",
+                    fn=lambda: None,
+                    operator="skip_assignment",
+                    target="game.status = 'won'",
+                ),
+                killed=False,
+            )
+        ]
+    ).report_text()
+
+    assert "SURVIVED skip assignment in demo()" in report
+    assert "Suggest: add an invariant or action postcondition" in report
 
 
 def test_api_checker_marks_postconditions_skipped_and_checks_invariants():
@@ -268,6 +367,7 @@ invariants = ["sample_app:thing_invariant"]
 seeds = ["sample_app:thing_seed"]
 budget = 12
 max_depth = 2
+guarded_ratio = 0.8
 api_generator = "schemathesis"
 """
     )
@@ -279,4 +379,5 @@ api_generator = "schemathesis"
     assert config.actions[0].name == "finish"
     assert config.budget == 12
     assert config.max_depth == 2
+    assert config.guarded_ratio == 0.8
     assert config.api_generator == "schemathesis"

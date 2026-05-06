@@ -195,6 +195,13 @@ def test_explorer_finds_demo_bugs(session, demo_actions):
     assert _has_transition(result, "Game.status", "won", "lost")
     assert _has_transition(result, "Cell.state", "revealed", "flagged")
     assert any(v.kind == "schema" and v.name == "orphan_detection" for v in result.violations)
+    flag_violation = next(
+        v for v in result.violations
+        if v.kind == "forbidden" and v.name == "Cell.state"
+    )
+    assert flag_violation.reproducer
+    assert flag_violation.original_sequence
+    assert any(step["mode"] == "unguarded" for step in flag_violation.reproducer)
 
     assert result.coverage["Game.status"]["denominator"] == 6
     assert result.coverage["Cell.state"]["denominator"] == 4
