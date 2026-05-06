@@ -514,10 +514,39 @@ def _failure_payload(failure: Any, label: str) -> dict[str, Any]:
         "name": failure.name,
         "message": failure.message,
         "after": label,
+        "shrunk": getattr(failure, "shrunk", False),
     }
 
 
 def _explore_summary(result: Any) -> dict[str, Any]:
+    violated_keys: set[tuple[str, str, str]] = set()
+    for v in result.violations:
+        if v.kind == "forbidden":
+            violated_keys.add((v.name, v.details.get("from", ""), v.details.get("to", "")))
+
+    transition_coverage: dict[str, Any] = {}
+    for field_name, cov in result.coverage.items():
+        pairs: list[dict[str, str]] = []
+        for pair in cov.get("observed", []):
+            pairs.append({"from": pair[0], "to": pair[1], "status": "observed"})
+        for pair in cov.get("unseen", []):
+            pairs.append({"from": pair[0], "to": pair[1], "status": "unseen"})
+        for pair in cov.get("forbidden", []):
+            status = "violated" if (field_name, pair[0], pair[1]) in violated_keys else "forbidden"
+            pairs.append({"from": pair[0], "to": pair[1], "status": status})
+        for pair in cov.get("ignored", []):
+            pairs.append({"from": pair[0], "to": pair[1], "status": "ignored"})
+        transition_coverage[field_name] = {
+            "pairs": pairs,
+            "observed_count": cov.get("observed_count", 0),
+            "denominator": cov.get("denominator", 0),
+        }
+
+    invariant_exercise: dict[str, Any] = {}
+    for name, count in result.invariant_coverage.items():
+        violations = sum(1 for v in result.violations if v.kind == "invariant" and v.name == name)
+        invariant_exercise[name] = {"checked": count, "violations": violations}
+
     return {
         "steps": result.steps_executed,
         "violations": [
@@ -533,6 +562,8 @@ def _explore_summary(result: Any) -> dict[str, Any]:
         "coverage": result.coverage,
         "mode_coverage": result.mode_coverage,
         "action_writes": result.action_writes,
+        "transition_coverage": transition_coverage,
+        "invariant_exercise": invariant_exercise,
     }
 
 
@@ -543,6 +574,13 @@ def _mutation_summary(result: Any) -> dict[str, Any]:
             "total": result.score[1],
             "percent": result.score_percent,
         },
+        "killed": [
+            {
+                "description": item.mutant.description,
+                "caught_by": ", ".join(sorted({v.name for v in item.violations})) or "violation",
+            }
+            for item in result.killed
+        ],
         "survived": [
             {
                 "description": item.mutant.description,
@@ -550,7 +588,6 @@ def _mutation_summary(result: Any) -> dict[str, Any]:
             }
             for item in result.survived[:8]
         ],
-        "killed_count": len(result.killed),
     }
 
 
@@ -559,314 +596,567 @@ _INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stipulate Minesweeper</title>
+<title>Stipulate &mdash; Minesweeper Demo</title>
 <style>
-:root {
-  color-scheme: light;
-  --bg: #f6f7f4;
-  --ink: #1f2933;
-  --muted: #697386;
-  --line: #c9d1d9;
-  --panel: #ffffff;
-  --green: #2f855a;
-  --red: #b42318;
-  --blue: #235789;
-  --amber: #9a6700;
+*,*::before,*::after{box-sizing:border-box}
+body{
+  margin:0;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;
+  background:#f7f8fa;
+  color:#1a1d26;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
 }
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--ink);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+.container{max-width:1120px;margin:0 auto;padding:0 24px 64px}
+.header{padding:32px 0 20px;margin-bottom:0}
+.header h1{font-size:22px;font-weight:700;letter-spacing:-0.02em;margin:0}
+.header h1 span{color:#4f46e5}
+.header p{color:#6b7280;font-size:14px;margin:4px 0 0}
+.tab-bar{
+  display:flex;gap:0;
+  border-bottom:1px solid #e5e7eb;
+  margin-bottom:24px;
 }
-main {
-  min-height: 100vh;
-  display: grid;
-  grid-template-columns: minmax(360px, 0.85fr) minmax(420px, 1.15fr);
-  gap: 24px;
-  padding: 24px;
+.tab-btn{
+  padding:10px 20px;font-size:14px;font-weight:500;
+  color:#6b7280;background:none;border:none;
+  border-bottom:2px solid transparent;
+  cursor:pointer;transition:color 0.15s,border-color 0.15s;
 }
-.stage, .report {
-  min-width: 0;
+.tab-btn:hover{color:#374151}
+.tab-btn.active{color:#4f46e5;border-bottom-color:#4f46e5}
+.tab-pane{display:none}
+.tab-pane.active{display:block;animation:fadeIn 0.25s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.play-grid{display:grid;grid-template-columns:auto 1fr;gap:32px;align-items:start}
+@media(max-width:800px){.play-grid{grid-template-columns:1fr}}
+.board-status{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.status-chip{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:4px 12px;border-radius:20px;
+  font-size:13px;font-weight:600;
+  background:#f3f4f6;color:#374151;border:1px solid #e5e7eb;
 }
-.topline {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 18px;
+.status-chip.red{background:#fef2f2;color:#b91c1c;border-color:#fecaca}
+.status-chip.green{background:#f0fdf4;color:#15803d;border-color:#bbf7d0}
+.board{
+  display:grid;grid-template-columns:repeat(3,1fr);
+  gap:3px;width:276px;padding:8px;
+  background:#a3aab8;border-radius:8px;
+  box-shadow:inset 0 2px 6px rgba(0,0,0,0.15),0 1px 3px rgba(0,0,0,0.08);
 }
-h1 {
-  margin: 0;
-  font-size: 28px;
-  line-height: 1.1;
+.cell{
+  aspect-ratio:1;border:none;border-radius:3px;
+  font-size:26px;font-weight:700;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  transition:all 0.08s ease;user-select:none;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 }
-.status {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+.cell.hidden{
+  background:linear-gradient(145deg,#dfe4ec,#c8ced8);
+  box-shadow:inset 1px 1px 0 rgba(255,255,255,0.65),inset -1px -1px 0 rgba(0,0,0,0.1),0 1px 2px rgba(0,0,0,0.06);
 }
-.chip {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 7px 10px;
-  background: var(--panel);
-  font-size: 13px;
-  font-weight: 650;
+.cell.hidden:hover{background:linear-gradient(145deg,#d8dde6,#c0c7d2)}
+.cell.hidden:active{background:#c0c7d2;box-shadow:inset 1px 1px 3px rgba(0,0,0,0.18)}
+.cell.revealed{
+  background:#edf0f4;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,0.06);
+  cursor:default;
 }
-.chip.red { color: var(--red); border-color: #f0b4ad; }
-.chip.green { color: var(--green); border-color: #a9d7bd; }
-.board {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(84px, 1fr));
-  gap: 10px;
-  max-width: 360px;
+.cell.revealed.n1{color:#2563eb}
+.cell.revealed.n2{color:#16a34a}
+.cell.revealed.n3{color:#dc2626}
+.cell.revealed.n4{color:#1e3a5f}
+.cell.flagged{
+  background:linear-gradient(145deg,#fef3c7,#fde68a);
+  box-shadow:inset 1px 1px 0 rgba(255,255,255,0.5),inset -1px -1px 0 rgba(0,0,0,0.06);
+  color:#92400e;
 }
-.cell {
-  aspect-ratio: 1;
-  border: 1px solid #9aa6b2;
-  border-radius: 8px;
-  background: #dfe6ee;
-  color: var(--ink);
-  font-size: 34px;
-  font-weight: 750;
-  cursor: pointer;
+.cell.mine{
+  background:#fee2e2;
+  box-shadow:inset 0 1px 2px rgba(220,38,38,0.12);
+  color:#dc2626;cursor:default;
 }
-.cell.revealed {
-  background: #ffffff;
-  border-color: #c5cdd6;
+.btn-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.btn{
+  padding:7px 14px;font-size:13px;font-weight:500;
+  border-radius:6px;border:1px solid #d1d5db;
+  background:#fff;color:#374151;cursor:pointer;
+  transition:all 0.12s;
 }
-.cell.flagged {
-  background: #fff4d6;
-  border-color: #e8ba42;
-  color: var(--amber);
+.btn:hover{background:#f9fafb;border-color:#9ca3af}
+.btn.active{background:#4f46e5;color:#fff;border-color:#4f46e5}
+.btn.danger{color:#b91c1c;border-color:#fca5a5}
+.btn.danger:hover{background:#fef2f2}
+.btn.primary{background:#4f46e5;color:#fff;border-color:#4338ca}
+.btn.primary:hover{background:#4338ca}
+.btn.primary:disabled{opacity:0.55;cursor:not-allowed}
+.btn.outline{background:transparent}
+.panel{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:20px;margin-bottom:16px}
+.panel h2{font-size:15px;font-weight:600;margin:0 0 12px;color:#111827}
+.panel-desc{color:#6b7280;font-size:13px;margin:0 0 12px}
+.item-list{display:grid;gap:6px}
+.item{
+  padding:10px 12px;border-radius:6px;font-size:13px;
+  line-height:1.4;border:1px solid #e5e7eb;background:#fafbfc;
 }
-.cell.mine {
-  background: #ffe7e3;
-  border-color: #e9a09a;
-  color: var(--red);
+.item strong{display:block;margin-bottom:2px}
+.item.bad{border-left:3px solid #dc2626;background:#fef2f2}
+.item.bad strong{color:#b91c1c}
+.item.good{border-left:3px solid #16a34a;background:#f0fdf4}
+.item.neutral{border-left:3px solid #94a3b8;background:#f9fafb}
+.empty-state{text-align:center;padding:32px 16px;color:#9ca3af;font-size:14px}
+.section-header{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:20px;gap:16px;
 }
-.controls, .scenarios, .panel {
-  margin-top: 18px;
-  padding: 14px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
+.section-header div{flex:1}
+.section-header h2{margin:0;font-size:18px;font-weight:600}
+.section-header .panel-desc{margin:4px 0 0}
+.stats-bar{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.stat-card{
+  flex:1;min-width:130px;padding:16px;
+  background:#fff;border:1px solid #e5e7eb;border-radius:10px;
 }
-.controls, .scenarios {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+.stat-card .label{
+  font-size:11px;font-weight:600;color:#6b7280;
+  text-transform:uppercase;letter-spacing:0.06em;
 }
-button.control {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #ffffff;
-  color: var(--ink);
-  padding: 10px 12px;
-  min-height: 40px;
-  font-weight: 650;
-  cursor: pointer;
+.stat-card .value{font-size:28px;font-weight:700;margin-top:4px;letter-spacing:-0.02em}
+.stat-card .value.red{color:#dc2626}
+.stat-card .value.green{color:#16a34a}
+.stat-card .value.blue{color:#2563eb}
+.violation-card{padding:16px;border:1px solid #fecaca;border-radius:8px;background:#fff;margin-bottom:10px}
+.violation-card .v-header{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.badge{
+  padding:2px 8px;border-radius:4px;font-size:11px;
+  font-weight:600;text-transform:uppercase;letter-spacing:0.04em;
 }
-button.control.active {
-  background: var(--blue);
-  border-color: var(--blue);
-  color: #ffffff;
+.badge.forbidden{background:#fef2f2;color:#b91c1c}
+.badge.schema{background:#fffbeb;color:#92400e}
+.badge.invariant{background:#eff6ff;color:#1e40af}
+.badge.postcondition{background:#f5f3ff;color:#5b21b6}
+.v-name{font-weight:600;font-size:14px;color:#111827}
+.v-msg{font-size:13px;color:#4b5563;margin-bottom:8px}
+.v-seq{
+  font-size:12px;
+  font-family:'SF Mono',SFMono-Regular,Consolas,'Liberation Mono',Menlo,monospace;
+  background:#f9fafb;border:1px solid #e5e7eb;
+  border-radius:6px;padding:10px 12px;color:#374151;
 }
-button.control.danger {
-  color: var(--red);
-  border-color: #f0b4ad;
+.v-seq .step{padding:2px 0}
+.v-seq .step-num{color:#9ca3af;margin-right:8px;font-size:11px}
+.shrunk-tag{font-size:11px;color:#6b7280;font-style:italic;margin-top:6px}
+.transition-section{margin-bottom:16px}
+.transition-section h3{font-size:14px;font-weight:600;margin:0 0 6px}
+.transition-section .summary{font-size:13px;color:#6b7280;margin-bottom:8px}
+.pair-list{display:grid;gap:3px}
+.pair-row{
+  display:flex;align-items:center;gap:8px;
+  padding:5px 10px;border-radius:4px;
+  font-size:13px;
+  font-family:'SF Mono',SFMono-Regular,Consolas,monospace;
 }
-.panel h2 {
-  margin: 0 0 10px;
-  font-size: 16px;
+.pair-row.observed{background:#f0fdf4;color:#166534}
+.pair-row.unseen{background:#f9fafb;color:#9ca3af}
+.pair-row.violated{background:#fef2f2;color:#b91c1c;font-weight:600}
+.pair-row.forbidden{background:#f9fafb;color:#9ca3af;text-decoration:line-through}
+.pair-row.ignored{background:#f9fafb;color:#d1d5db;font-style:italic}
+.pair-row .arrow{margin:0 2px;color:#9ca3af;text-decoration:none !important}
+.pair-row .status-label{margin-left:auto;font-size:11px;font-weight:500;font-family:-apple-system,sans-serif;text-decoration:none !important}
+.score-hero{
+  text-align:center;padding:32px 24px;
+  background:#fff;border:1px solid #e5e7eb;
+  border-radius:12px;margin-bottom:20px;
 }
-.list {
-  display: grid;
-  gap: 8px;
+.score-hero .pct{font-size:64px;font-weight:800;letter-spacing:-0.04em;line-height:1}
+.score-hero .pct.high{color:#16a34a}
+.score-hero .pct.mid{color:#d97706}
+.score-hero .pct.low{color:#dc2626}
+.score-hero .detail{font-size:15px;color:#6b7280;margin-top:8px}
+.mutant-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media(max-width:700px){.mutant-grid{grid-template-columns:1fr}}
+.mutant-section h3{font-size:14px;font-weight:600;margin:0 0 10px;display:flex;align-items:center;gap:6px}
+.mutant-card{padding:12px;border-radius:6px;margin-bottom:8px;font-size:13px;line-height:1.4}
+.mutant-card.killed{background:#f0fdf4;border:1px solid #bbf7d0}
+.mutant-card .mc-label{font-weight:600}
+.mutant-card.killed .mc-label{color:#166534}
+.mutant-card .caught{color:#15803d;font-size:12px;margin-top:4px}
+.mutant-card.survived{background:#fffbeb;border:1px solid #fde68a}
+.mutant-card.survived .mc-label{color:#92400e}
+.mutant-card .suggestion{color:#78716c;font-size:12px;margin-top:4px}
+.loading{
+  display:flex;flex-direction:column;align-items:center;
+  gap:12px;padding:48px 16px;color:#6b7280;font-size:14px;
 }
-.item {
-  border: 1px solid #d8dee6;
-  border-radius: 8px;
-  padding: 10px;
-  background: #fbfcfd;
-  font-size: 13px;
-  line-height: 1.35;
+.spinner{
+  width:24px;height:24px;
+  border:3px solid #e5e7eb;border-top-color:#4f46e5;
+  border-radius:50%;animation:spin 0.7s linear infinite;
 }
-.item strong {
-  display: block;
-  margin-bottom: 3px;
+@keyframes spin{to{transform:rotate(360deg)}}
+.inv-table{width:100%;border-collapse:collapse;font-size:13px}
+.inv-table th{
+  text-align:left;padding:8px 10px;
+  border-bottom:2px solid #e5e7eb;
+  font-weight:600;color:#6b7280;font-size:11px;
+  text-transform:uppercase;letter-spacing:0.05em;
 }
-.item.bad strong { color: var(--red); }
-.item.good strong { color: var(--green); }
-pre {
-  max-height: 320px;
-  overflow: auto;
-  margin: 0;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #101820;
-  color: #f4f7fb;
-  font-size: 12px;
-  line-height: 1.45;
+.inv-table td{padding:8px 10px;border-bottom:1px solid #f3f4f6}
+.detail-block{margin-bottom:12px}
+.detail-block .detail-label{
+  font-size:11px;font-weight:600;color:#6b7280;
+  text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;
 }
-@media (max-width: 880px) {
-  main { grid-template-columns: 1fr; padding: 16px; }
-  .topline { align-items: flex-start; flex-direction: column; }
-  .status { justify-content: flex-start; }
-  .board { max-width: none; }
-}
+.detail-block .detail-row{font-size:13px;color:#374151;padding:1px 0}
 </style>
 </head>
 <body>
-<main>
-  <section class="stage">
-    <div class="topline">
-      <h1>Stipulate Minesweeper</h1>
-      <div class="status">
-        <span class="chip" id="gameStatus">status: loading</span>
-        <span class="chip" id="orphans">orphans: 0</span>
+<div class="container">
+  <div class="header">
+    <h1><span>stipulate</span> minesweeper</h1>
+    <p>Property-based exploration for stateful systems</p>
+  </div>
+
+  <nav class="tab-bar" id="tabBar">
+    <button class="tab-btn active" data-tab="play">Play</button>
+    <button class="tab-btn" data-tab="explore">Explore</button>
+    <button class="tab-btn" data-tab="mutate">Mutate</button>
+  </nav>
+
+  <div class="tab-pane active" id="pane-play">
+    <div class="play-grid">
+      <div>
+        <div class="board-status">
+          <span class="status-chip" id="gameStatus">loading</span>
+          <span class="status-chip" id="orphanChip" style="display:none">orphans: 0</span>
+        </div>
+        <div class="board" id="board"></div>
+        <div class="btn-row">
+          <button class="btn active" id="revealMode">Reveal</button>
+          <button class="btn" id="flagMode">Flag</button>
+          <span style="width:6px"></span>
+          <button class="btn" onclick="post('/api/check-win')">Check win</button>
+          <button class="btn danger" onclick="post('/api/delete-game')">Delete game</button>
+          <button class="btn" onclick="post('/api/reset')">Reset</button>
+        </div>
+        <div class="btn-row" style="margin-top:6px">
+          <button class="btn outline" onclick="scenario('lostWon')">lost &rarr; won</button>
+          <button class="btn outline" onclick="scenario('wonLost')">won &rarr; lost</button>
+          <button class="btn outline" onclick="scenario('revealedFlagged')">revealed &rarr; flagged</button>
+          <button class="btn outline" onclick="scenario('orphan')">orphan rows</button>
+        </div>
+      </div>
+      <div>
+        <div class="panel">
+          <h2>Live Findings <span class="status-chip" id="findingCount" style="font-size:11px;padding:2px 8px">0</span></h2>
+          <div class="item-list" id="liveFindings">
+            <div class="empty-state">Play the game to trigger invariant checks</div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Event Log</h2>
+          <div class="item-list" id="events"></div>
+        </div>
       </div>
     </div>
-    <div class="board" id="board"></div>
-    <div class="controls">
-      <button class="control active" id="revealMode">Reveal</button>
-      <button class="control" id="flagMode">Flag</button>
-      <button class="control" onclick="post('/api/check-win')">Check win</button>
-      <button class="control danger" onclick="post('/api/delete-game')">Delete game</button>
-      <button class="control" onclick="post('/api/reset')">Reset</button>
-    </div>
-    <div class="scenarios">
-      <button class="control" onclick="scenario('lostWon')">lost -> won</button>
-      <button class="control" onclick="scenario('wonLost')">won -> lost</button>
-      <button class="control" onclick="scenario('revealedFlagged')">revealed -> flagged</button>
-      <button class="control" onclick="scenario('orphan')">orphan rows</button>
-    </div>
-    <div class="panel">
-      <h2>Live findings</h2>
-      <div class="list" id="liveFindings"></div>
-    </div>
-  </section>
-  <section class="report">
-    <div class="panel">
-      <h2>Stipulate exploration</h2>
-      <div class="controls">
-        <button class="control" onclick="runExplore()">Run Stipulate</button>
-        <button class="control" onclick="runMutate()">Mutation after fixes</button>
+  </div>
+
+  <div class="tab-pane" id="pane-explore">
+    <div class="section-header">
+      <div>
+        <h2>Exploration</h2>
+        <p class="panel-desc">Automatically discover invariant violations and measure transition coverage.</p>
       </div>
-      <div class="list" id="stipulateFindings"></div>
+      <button class="btn primary" id="exploreBtn" onclick="runExplore()">Run Exploration</button>
     </div>
-    <div class="panel">
-      <h2>Coverage</h2>
-      <pre id="coverage">Run Stipulate to populate coverage.</pre>
+    <div id="exploreResults"><div class="empty-state">Click &ldquo;Run Exploration&rdquo; to start</div></div>
+  </div>
+
+  <div class="tab-pane" id="pane-mutate">
+    <div class="section-header">
+      <div>
+        <h2>Mutation Testing</h2>
+        <p class="panel-desc">Test invariant strength against automatically generated code mutations.</p>
+      </div>
+      <button class="btn primary" id="mutateBtn" onclick="runMutate()">Run Mutation Testing</button>
     </div>
-    <div class="panel">
-      <h2>Event log</h2>
-      <div class="list" id="events"></div>
-    </div>
-  </section>
-</main>
+    <div id="mutateResults"><div class="empty-state">Click &ldquo;Run Mutation Testing&rdquo; to start</div></div>
+  </div>
+</div>
+
 <script>
-let mode = "reveal";
+document.getElementById('tabBar').addEventListener('click', function(e) {
+  var btn = e.target.closest('.tab-btn');
+  if (!btn) return;
+  var tab = btn.dataset.tab;
+  document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.toggle('active', b === btn); });
+  document.querySelectorAll('.tab-pane').forEach(function(p) { p.classList.toggle('active', p.id === 'pane-' + tab); });
+});
+
+var mode = 'reveal';
+document.getElementById('revealMode').onclick = function() { setMode('reveal'); };
+document.getElementById('flagMode').onclick = function() { setMode('flag'); };
+
+function setMode(m) {
+  mode = m;
+  document.getElementById('revealMode').classList.toggle('active', m === 'reveal');
+  document.getElementById('flagMode').classList.toggle('active', m === 'flag');
+}
 
 async function loadState() {
-  const response = await fetch("/api/state");
-  render(await response.json());
+  var r = await fetch('/api/state');
+  render(await r.json());
 }
 
 async function post(path) {
-  const response = await fetch(path, {method: "POST"});
-  render(await response.json());
-}
-
-function setMode(next) {
-  mode = next;
-  document.getElementById("revealMode").classList.toggle("active", mode === "reveal");
-  document.getElementById("flagMode").classList.toggle("active", mode === "flag");
+  var r = await fetch(path, {method: 'POST'});
+  render(await r.json());
 }
 
 async function cellClick(row, col) {
-  await post(`/api/${mode}/${row}/${col}`);
+  await post('/api/' + mode + '/' + row + '/' + col);
 }
 
 async function scenario(name) {
-  await post("/api/reset");
-  const steps = {
-    lostWon: ["/api/reveal/0/0", "/api/reveal/2/2", "/api/check-win"],
-    wonLost: ["/api/reveal/2/2", "/api/check-win", "/api/reveal/0/0"],
-    revealedFlagged: ["/api/flag/1/1"],
-    orphan: ["/api/delete-game"]
+  await post('/api/reset');
+  var steps = {
+    lostWon: ['/api/reveal/0/0', '/api/reveal/2/2', '/api/check-win'],
+    wonLost: ['/api/reveal/2/2', '/api/check-win', '/api/reveal/0/0'],
+    revealedFlagged: ['/api/flag/1/1'],
+    orphan: ['/api/delete-game']
   }[name];
-  for (const step of steps) {
-    await post(step);
-  }
-}
-
-async function runExplore() {
-  document.getElementById("stipulateFindings").innerHTML = item("Running exploration...", "", false);
-  const response = await fetch("/api/stipulate/explore");
-  const data = await response.json();
-  const rows = data.violations.map(v => item(`${v.kind}: ${v.name}`, `${v.message}<br>${v.sequence.join(" -> ")}`, true));
-  document.getElementById("stipulateFindings").innerHTML = rows.join("");
-  document.getElementById("coverage").textContent = JSON.stringify({
-    steps: data.steps,
-    coverage: data.coverage,
-    mode_coverage: data.mode_coverage,
-    action_writes: data.action_writes
-  }, null, 2);
-}
-
-async function runMutate() {
-  document.getElementById("stipulateFindings").innerHTML = item("Running mutation...", "", false);
-  const response = await fetch("/api/stipulate/mutate");
-  const data = await response.json();
-  const header = item(`Mutation score: ${data.score.killed}/${data.score.total}`, `${Math.round(data.score.percent)}% killed on the fixed-code phase.`, false);
-  const survived = data.survived.map(v => item(v.description, v.suggestion, true));
-  document.getElementById("stipulateFindings").innerHTML = [header, ...survived].join("");
+  for (var i = 0; i < steps.length; i++) await post(steps[i]);
 }
 
 function render(data) {
-  const gameStatus = document.getElementById("gameStatus");
-  const status = data.game ? data.game.status : "deleted";
-  gameStatus.textContent = `status: ${status}`;
-  gameStatus.classList.toggle("red", status === "lost" || status === "deleted");
-  gameStatus.classList.toggle("green", status === "won");
-  const orphanChip = document.getElementById("orphans");
-  orphanChip.textContent = `orphans: ${data.orphan_count}`;
-  orphanChip.classList.toggle("red", data.orphan_count > 0);
+  var gs = document.getElementById('gameStatus');
+  var status = data.game ? data.game.status : 'deleted';
+  gs.textContent = status;
+  gs.className = 'status-chip' + (status === 'lost' || status === 'deleted' ? ' red' : '') + (status === 'won' ? ' green' : '');
 
-  const board = document.getElementById("board");
-  board.innerHTML = "";
-  for (const cell of data.cells) {
-    const button = document.createElement("button");
-    button.className = `cell ${cell.state}`;
-    if (cell.is_mine && cell.state === "revealed") button.classList.add("mine");
-    button.textContent = cellLabel(cell);
-    button.onclick = () => cellClick(cell.row, cell.col);
-    board.appendChild(button);
+  var oc = document.getElementById('orphanChip');
+  if (data.orphan_count > 0) {
+    oc.style.display = '';
+    oc.textContent = 'orphans: ' + data.orphan_count;
+    oc.className = 'status-chip red';
+  } else {
+    oc.style.display = 'none';
   }
 
-  document.getElementById("liveFindings").innerHTML =
-    data.findings.length ? data.findings.map(f => item(`${f.kind}: ${f.name}`, `${f.message}<br>after ${f.after}`, true)).join("") : item("No live findings yet", "", false);
-  document.getElementById("events").innerHTML = data.events.map(e => item(e, "", false)).join("");
+  var board = document.getElementById('board');
+  board.innerHTML = '';
+  for (var i = 0; i < data.cells.length; i++) {
+    var cell = data.cells[i];
+    var btn = document.createElement('button');
+    var cls = 'cell ' + cell.state;
+    if (cell.is_mine && cell.state === 'revealed') cls = 'cell mine';
+    if (cell.state === 'revealed' && !cell.is_mine && cell.adjacent_mines > 0)
+      cls += ' n' + Math.min(cell.adjacent_mines, 4);
+    btn.className = cls;
+    btn.textContent = cellLabel(cell);
+    btn.onclick = (function(r, c) { return function() { cellClick(r, c); }; })(cell.row, cell.col);
+    board.appendChild(btn);
+  }
+
+  var fc = document.getElementById('findingCount');
+  fc.textContent = data.findings.length;
+  fc.className = 'status-chip' + (data.findings.length > 0 ? ' red' : '');
+
+  var lf = document.getElementById('liveFindings');
+  if (data.findings.length) {
+    lf.innerHTML = data.findings.map(function(f) {
+      return '<div class="item bad"><strong>' + esc(f.kind) + ': ' + esc(f.name) + '</strong>'
+        + esc(f.message) + '<br><span style="color:#9ca3af;font-size:12px">after ' + esc(f.after) + '</span>'
+        + (f.shrunk ? '<br><span style="color:#9ca3af;font-size:11px;font-style:italic">sequence was shrunk</span>' : '')
+        + '</div>';
+    }).join('');
+  } else {
+    lf.innerHTML = '<div class="empty-state">No violations detected yet</div>';
+  }
+
+  var ev = document.getElementById('events');
+  ev.innerHTML = data.events.map(function(e) {
+    return '<div class="item neutral"><strong>' + esc(e) + '</strong></div>';
+  }).join('');
 }
 
 function cellLabel(cell) {
-  if (cell.state === "flagged") return "F";
-  if (cell.state === "hidden") return "";
-  if (cell.is_mine) return "M";
-  return cell.adjacent_mines ? String(cell.adjacent_mines) : "";
+  if (cell.state === 'flagged') return '\u2691';
+  if (cell.state === 'hidden') return '';
+  if (cell.is_mine) return '\u2738';
+  return cell.adjacent_mines ? String(cell.adjacent_mines) : '';
 }
 
-function item(title, body, bad) {
-  return `<div class="item ${bad ? "bad" : "good"}"><strong>${title}</strong>${body || ""}</div>`;
+async function runExplore() {
+  var btn = document.getElementById('exploreBtn');
+  btn.disabled = true; btn.textContent = 'Running\u2026';
+  document.getElementById('exploreResults').innerHTML =
+    '<div class="loading"><div class="spinner"></div>Running exploration\u2026</div>';
+  try {
+    var r = await fetch('/api/stipulate/explore');
+    renderExploreResults(await r.json());
+  } catch(e) {
+    document.getElementById('exploreResults').innerHTML =
+      '<div class="item bad"><strong>Error</strong>' + esc(e.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = 'Run Exploration';
 }
 
-document.getElementById("revealMode").onclick = () => setMode("reveal");
-document.getElementById("flagMode").onclick = () => setMode("flag");
+function renderExploreResults(data) {
+  var html = '';
+  var vc = data.violations.length;
+  var totalObs = 0, totalDenom = 0;
+  if (data.transition_coverage) {
+    for (var k in data.transition_coverage) {
+      totalObs += data.transition_coverage[k].observed_count;
+      totalDenom += data.transition_coverage[k].denominator;
+    }
+  }
+  var covPct = totalDenom > 0 ? Math.round(totalObs / totalDenom * 100) : 0;
+
+  html += '<div class="stats-bar">'
+    + '<div class="stat-card"><div class="label">Steps Executed</div><div class="value blue">' + data.steps + '</div></div>'
+    + '<div class="stat-card"><div class="label">Violations</div><div class="value ' + (vc > 0 ? 'red' : 'green') + '">' + vc + '</div></div>'
+    + '<div class="stat-card"><div class="label">Transition Coverage</div><div class="value">' + totalObs + '<span style="color:#6b7280;font-weight:400">/' + totalDenom + '</span> <span style="font-size:15px;color:#6b7280;font-weight:400">(' + covPct + '%)</span></div></div>'
+    + '</div>';
+
+  if (data.violations.length > 0) {
+    html += '<div class="panel"><h2>Violations</h2>';
+    data.violations.forEach(function(v) {
+      html += '<div class="violation-card">'
+        + '<div class="v-header"><span class="badge ' + v.kind + '">' + v.kind + '</span>'
+        + '<span class="v-name">' + esc(v.name) + '</span></div>'
+        + '<div class="v-msg">' + esc(v.message) + '</div>';
+      if (v.sequence && v.sequence.length > 0) {
+        html += '<div class="v-seq">';
+        v.sequence.forEach(function(s, i) {
+          html += '<div class="step"><span class="step-num">' + (i + 1) + '.</span>' + esc(s) + '</div>';
+        });
+        html += '</div>';
+      }
+      if (v.shrunk) html += '<div class="shrunk-tag">sequence was shrunk to minimal reproducer</div>';
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+
+  if (data.transition_coverage) {
+    html += '<div class="panel"><h2>Transition Coverage</h2>';
+    for (var field in data.transition_coverage) {
+      var tc = data.transition_coverage[field];
+      html += '<div class="transition-section">'
+        + '<h3>' + esc(field) + '</h3>'
+        + '<div class="summary">' + tc.observed_count + ' observed / ' + tc.denominator + ' reportable pairs</div>'
+        + '<div class="pair-list">';
+      var order = {observed:0, violated:1, unseen:2, forbidden:3, ignored:4};
+      var sorted = tc.pairs.slice().sort(function(a, b) { return (order[a.status]||5) - (order[b.status]||5); });
+      var labels = {observed:'\u2713 observed', unseen:'\u00b7 unseen', violated:'\u2717 VIOLATED', forbidden:'\u2298 forbidden', ignored:'~ ignored'};
+      sorted.forEach(function(p) {
+        html += '<div class="pair-row ' + p.status + '">'
+          + esc(p.from) + ' <span class="arrow">\u2192</span> ' + esc(p.to)
+          + '<span class="status-label">' + (labels[p.status] || p.status) + '</span></div>';
+      });
+      html += '</div></div>';
+    }
+    html += '</div>';
+  }
+
+  if (data.invariant_exercise) {
+    var invKeys = Object.keys(data.invariant_exercise);
+    if (invKeys.length > 0) {
+      html += '<div class="panel"><h2>Invariant Exercise</h2>'
+        + '<table class="inv-table"><thead><tr><th>Invariant</th><th>Scenarios</th><th>Violations</th></tr></thead><tbody>';
+      invKeys.forEach(function(name) {
+        var inv = data.invariant_exercise[name];
+        var style = inv.violations > 0 ? ' style="color:#b91c1c;font-weight:600"' : '';
+        html += '<tr><td>' + esc(name) + '</td><td>' + inv.checked + '</td><td' + style + '>' + inv.violations + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+  }
+
+  html += '<div class="panel"><h2>Exploration Details</h2>';
+  if (data.mode_coverage) {
+    html += '<div class="detail-block"><div class="detail-label">Mode Coverage</div>';
+    for (var m in data.mode_coverage) html += '<div class="detail-row">' + esc(m) + ': ' + data.mode_coverage[m] + 'x</div>';
+    html += '</div>';
+  }
+  if (data.action_writes) {
+    html += '<div class="detail-block"><div class="detail-label">Action Writes</div>';
+    for (var a in data.action_writes) {
+      var w = data.action_writes[a];
+      var fields = Object.keys(w).map(function(k) { return k + ': ' + w[k] + 'x'; }).join(', ');
+      html += '<div class="detail-row">' + esc(a) + ' \u2014 ' + (fields || 'no writes') + '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  document.getElementById('exploreResults').innerHTML = html;
+}
+
+async function runMutate() {
+  var btn = document.getElementById('mutateBtn');
+  btn.disabled = true; btn.textContent = 'Running\u2026';
+  document.getElementById('mutateResults').innerHTML =
+    '<div class="loading"><div class="spinner"></div>Running mutation testing\u2026</div>';
+  try {
+    var r = await fetch('/api/stipulate/mutate');
+    renderMutateResults(await r.json());
+  } catch(e) {
+    document.getElementById('mutateResults').innerHTML =
+      '<div class="item bad"><strong>Error</strong>' + esc(e.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = 'Run Mutation Testing';
+}
+
+function renderMutateResults(data) {
+  var html = '';
+  var pct = Math.round(data.score.percent);
+  var cls = pct >= 80 ? 'high' : pct >= 50 ? 'mid' : 'low';
+
+  html += '<div class="score-hero">'
+    + '<div class="pct ' + cls + '">' + pct + '%</div>'
+    + '<div class="detail">' + data.score.killed + ' of ' + data.score.total + ' mutants killed</div>'
+    + '</div>';
+
+  html += '<div class="mutant-grid">';
+
+  html += '<div class="mutant-section"><h3><span style="color:#16a34a">\u2713</span> Killed (' + (data.killed ? data.killed.length : 0) + ')</h3>';
+  if (data.killed && data.killed.length > 0) {
+    data.killed.forEach(function(k) {
+      html += '<div class="mutant-card killed">'
+        + '<div class="mc-label">' + esc(k.description) + '</div>'
+        + '<div class="caught">caught by ' + esc(k.caught_by) + '</div></div>';
+    });
+  } else {
+    html += '<div class="empty-state">No mutants killed</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="mutant-section"><h3><span style="color:#dc2626">\u2717</span> Survived (' + data.survived.length + ')</h3>';
+  if (data.survived.length > 0) {
+    data.survived.forEach(function(s) {
+      html += '<div class="mutant-card survived">'
+        + '<div class="mc-label">' + esc(s.description) + '</div>'
+        + '<div class="suggestion">' + esc(s.suggestion) + '</div></div>';
+    });
+  } else {
+    html += '<div class="empty-state" style="color:#16a34a">All mutants killed!</div>';
+  }
+  html += '</div></div>';
+
+  document.getElementById('mutateResults').innerHTML = html;
+}
+
+function esc(s) {
+  if (s == null) return '';
+  var d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
 loadState();
 </script>
 </body>
