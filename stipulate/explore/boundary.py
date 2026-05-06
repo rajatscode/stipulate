@@ -37,34 +37,64 @@ def _function_boundaries(fn: Callable[..., Any]) -> list[tuple[str, Any]]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Compare):
             continue
-        left_name = _boundary_name(node.left)
-        for comparator in node.comparators:
-            right_value = _literal_value(comparator)
-            if left_name is not None and right_value is not _MISSING:
-                values.append((left_name, right_value))
+        left_names = _boundary_names(node.left)
+        for op, comparator in zip(node.ops, node.comparators):
+            right_values = _literal_values(comparator)
+            if left_names and right_values:
+                for name in left_names:
+                    for value in _boundary_neighbors(op, right_values):
+                        values.append((name, value))
                 continue
-            right_name = _boundary_name(comparator)
-            left_value = _literal_value(node.left)
-            if right_name is not None and left_value is not _MISSING:
-                values.append((right_name, left_value))
+            right_names = _boundary_names(comparator)
+            left_values = _literal_values(node.left)
+            if right_names and left_values:
+                for name in right_names:
+                    for value in _boundary_neighbors(op, left_values):
+                        values.append((name, value))
     return values
 
 
-def _boundary_name(node: ast.AST) -> str | None:
+def _boundary_names(node: ast.AST) -> tuple[str, ...]:
     if isinstance(node, ast.Name):
-        return node.id
+        return (node.id,)
     if isinstance(node, ast.Attribute):
-        return node.attr
-    return None
+        parent = _boundary_names(node.value)
+        names = [node.attr]
+        names.extend(f"{item}.{node.attr}" for item in parent)
+        return tuple(names)
+    return ()
 
 
-_MISSING = object()
-
-
-def _literal_value(node: ast.AST) -> Any:
+def _literal_values(node: ast.AST) -> tuple[Any, ...]:
     if isinstance(node, ast.Constant):
-        return node.value
-    return _MISSING
+        return (node.value,)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        values = _literal_values(node.operand)
+        if len(values) == 1 and isinstance(values[0], (int, float)):
+            return (-values[0],)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        values: list[Any] = []
+        for item in node.elts:
+            item_values = _literal_values(item)
+            if not item_values:
+                return ()
+            values.extend(item_values)
+        return tuple(values)
+    return ()
+
+
+def _boundary_neighbors(op: ast.cmpop, values: tuple[Any, ...]) -> tuple[Any, ...]:
+    output: list[Any] = []
+    for value in values:
+        output.append(value)
+        if isinstance(value, bool):
+            output.append(not value)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            if isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+                output.extend([value - 1, value + 1])
+        elif isinstance(value, float) and isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+            output.extend([value - 0.5, value + 0.5])
+    return tuple(output)
 
 
 def _append(values: dict[str, list[Any]], name: str, value: Any) -> None:

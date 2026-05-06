@@ -78,6 +78,7 @@ class ApiRequest:
     operation_id: str
     query: dict[str, Any]
     headers: dict[str, Any]
+    expected_statuses: tuple[str, ...] = ()
     body: Any = _NO_BODY
     validate_response: Callable[[Any], None] | None = field(
         default=None,
@@ -102,6 +103,7 @@ class ApiExplorer:
     budget: int = 100
     schema_checks: bool = True
     generator: str = "openapi"
+    headers: dict[str, str] | None = None
     _seeded: bool = False
 
     def run(self) -> ExplorationResult:
@@ -133,6 +135,10 @@ class ApiExplorer:
                     )
                 )
                 continue
+            status_code = getattr(response, "status_code", None)
+            if isinstance(status_code, int):
+                statuses = result.api_status_coverage.setdefault(request.label, {})
+                statuses[status_code] = statuses.get(status_code, 0) + 1
 
             status_failure = _response_status_failure(request, response)
             if status_failure is not None:
@@ -163,8 +169,9 @@ class ApiExplorer:
         kwargs: dict[str, Any] = {}
         if request.query:
             kwargs["params"] = request.query
-        if request.headers:
-            kwargs["headers"] = request.headers
+        headers = {**(self.headers or {}), **request.headers}
+        if headers:
+            kwargs["headers"] = headers
         if request.body is not _NO_BODY:
             kwargs["json"] = request.body
         return client.request(request.method, request.path, **kwargs)
@@ -204,6 +211,7 @@ def create_api_explorer(
     budget: int = 100,
     schema_checks: bool = True,
     generator: str = "openapi",
+    headers: dict[str, str] | None = None,
 ) -> ApiExplorer:
     return ApiExplorer(
         models=models,
@@ -216,6 +224,7 @@ def create_api_explorer(
         budget=budget,
         schema_checks=schema_checks,
         generator=generator,
+        headers=headers,
     )
 
 
@@ -271,6 +280,7 @@ def _request_from_schemathesis_case(case: Any, values: dict[str, list[Any]]) -> 
         operation_id=label or f"{method.upper()} {path_template}",
         query=query,
         headers=headers,
+        expected_statuses=(),
         body=body,
         validate_response=getattr(case, "validate_response", None),
     )
@@ -330,6 +340,7 @@ def _api_request(
 
     path = _render_path(path_template, path_values)
     body = _request_body(operation, values, root)
+    expected_statuses = tuple(str(status) for status in operation.get("responses", {}))
     return ApiRequest(
         method=method,
         path_template=path_template,
@@ -337,6 +348,7 @@ def _api_request(
         operation_id=operation.get("operationId") or f"{method.upper()} {path_template}",
         query=query,
         headers=headers,
+        expected_statuses=expected_statuses,
         body=body,
     )
 
@@ -494,7 +506,23 @@ def _resolve_ref(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]
 
 def _response_status_failure(request: ApiRequest, response: Any) -> CheckFailure | None:
     status_code = getattr(response, "status_code", None)
-    if status_code is None or status_code < 500:
+    if status_code is None:
+        return None
+    if request.expected_statuses and not _status_expected(status_code, request.expected_statuses):
+        return CheckFailure(
+            kind="api_response",
+            name=request.label,
+            message=(
+                f"{request.label} returned undocumented HTTP {status_code}; "
+                f"expected one of {', '.join(request.expected_statuses)}"
+            ),
+            details={
+                "status_code": status_code,
+                "path": request.path,
+                "expected": list(request.expected_statuses),
+            },
+        )
+    if status_code < 500:
         return None
     return CheckFailure(
         kind="api_response",
@@ -502,6 +530,13 @@ def _response_status_failure(request: ApiRequest, response: Any) -> CheckFailure
         message=f"{request.label} returned HTTP {status_code}",
         details={"status_code": status_code, "path": request.path},
     )
+
+
+def _status_expected(status_code: int, expected: tuple[str, ...]) -> bool:
+    code = str(status_code)
+    family = f"{code[0]}XX"
+    normalized = {item.upper() for item in expected}
+    return code in expected or family in normalized or "DEFAULT" in normalized
 
 
 def _validate_api_response(request: ApiRequest, response: Any) -> CheckFailure | None:

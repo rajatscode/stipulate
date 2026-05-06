@@ -30,6 +30,8 @@ empirical action write graph, and opt-in incremental invariant checking via
 `@invariant(reads=[...])`. For harder state spaces, direct mode can also
 use a Hypothesis-backed sequence optimizer with native example shrinking via
 `optimizer = "hypothesis"` or `stipulate explore --optimizer hypothesis`.
+Reports can be emitted as JSON with `--json`, and API mode supports configured
+headers plus documented-response status checking for CI workflows.
 
 ## Development
 

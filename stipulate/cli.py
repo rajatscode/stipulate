@@ -12,14 +12,17 @@ from stipulate.config import (
     write_schema_snapshot,
 )
 from stipulate.core.utils import call_with_supported_kwargs, import_object
+from stipulate.report import drift_to_dict, exploration_to_dict, mutation_to_dict
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="stipulate")
     parser.add_argument("--config", default="pyproject.toml")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     explore = subcommands.add_parser("explore")
+    explore.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     explore.add_argument("--db", help="Import path for a DB session factory.")
     explore.add_argument(
         "--optimizer",
@@ -28,13 +31,21 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     mutate = subcommands.add_parser("mutate")
+    mutate.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     mutate.add_argument("--db", help="Import path for a DB session factory.")
 
     api = subcommands.add_parser("api")
+    api.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     api.add_argument("--db", help="Import path for a DB session factory.")
     api.add_argument("--app", help="Import path for a FastAPI/Starlette app.")
     api.add_argument("--client", help="Import path for an API client or client factory.")
     api.add_argument("--openapi", help="Import path for an OpenAPI schema dict or factory.")
+    api.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        help="Header for API mode, formatted as 'Name: value'. Can be repeated.",
+    )
     api.add_argument(
         "--generator",
         choices=("openapi", "schemathesis"),
@@ -42,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     drift = subcommands.add_parser("drift")
+    drift.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     drift.add_argument("--previous", help="Path to a previous schema snapshot JSON.")
     drift.add_argument("--write-snapshot", help="Write current schema snapshot to this path.")
 
@@ -54,16 +66,20 @@ def main(argv: list[str] | None = None) -> int:
             if args.optimizer is not None:
                 explorer.config = replace(explorer.config, optimizer=args.optimizer)
             result = explorer.run()
-        _print_explore_result(result)
+        _print_json(exploration_to_dict(result)) if args.json else _print_explore_result(result)
         return 1 if result.violations else 0
 
     if args.command == "mutate":
         with open_configured_db(config, args.db) as db:
             result = config.create_explorer(db).mutate()
-        print(result.report_text())
+        _print_json(mutation_to_dict(result)) if args.json else print(result.report_text())
         return 1 if result.unexpected_survivors else 0
 
     if args.command == "api":
+        try:
+            headers = _parse_headers(args.header)
+        except ValueError as exc:
+            parser.error(str(exc))
         with open_configured_db(config, args.db) as db:
             client = _load_client(args.client, db)
             result = _create_api_explorer(
@@ -73,14 +89,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.openapi,
                 client,
                 args.generator,
+                headers,
             ).run()
-        _print_explore_result(result)
+        _print_json(exploration_to_dict(result)) if args.json else _print_explore_result(result)
         return 1 if result.violations else 0
 
     if args.command == "drift":
         if args.write_snapshot:
             write_schema_snapshot(config, args.write_snapshot)
         issues = detect_config_drift(config, previous_snapshot=args.previous)
+        if args.json:
+            _print_json(drift_to_dict(issues))
+            return 1 if issues else 0
         for issue in issues:
             print(f"{issue.kind}: {issue.message}")
         if not issues:
@@ -106,6 +126,7 @@ def _create_api_explorer(
     openapi_path: str | None,
     client: Any,
     generator: str | None,
+    headers: dict[str, str],
 ) -> Any:
     app = import_object(app_path) if app_path else None
     openapi = import_object(openapi_path) if openapi_path else None
@@ -116,7 +137,23 @@ def _create_api_explorer(
         explorer.openapi = openapi
     if generator is not None:
         explorer.generator = generator
+    if headers:
+        explorer.headers = {**(explorer.headers or {}), **headers}
     return explorer
+
+
+def _parse_headers(items: list[str]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for item in items:
+        name, sep, value = item.partition(":")
+        if not sep or not name.strip():
+            raise ValueError(f"Expected header formatted as 'Name: value', got {item!r}")
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+def _print_json(data: Any) -> None:
+    print(json.dumps(data, indent=2, sort_keys=True, default=str))
 
 
 def _print_explore_result(result: Any) -> None:
@@ -156,6 +193,9 @@ def _print_explore_result(result: Any) -> None:
     if result.api_coverage:
         print("api coverage:")
         print(json.dumps(result.api_coverage, indent=2, sort_keys=True, default=str))
+    if result.api_status_coverage:
+        print("api status coverage:")
+        print(json.dumps(result.api_status_coverage, indent=2, sort_keys=True, default=str))
 
 
 def _format_reproducer_step(step: dict[str, Any]) -> str:

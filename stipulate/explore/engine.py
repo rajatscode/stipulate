@@ -58,6 +58,13 @@ class PlanEvaluation:
     failure: CheckFailure | None = None
 
 
+class _RollbackRequested(Exception):
+    """Application code attempted to rollback inside an explorer-owned savepoint."""
+
+
+_ORIGINAL_ROLLBACKS: dict[int, Callable[[], Any]] = {}
+
+
 class Explorer:
     def __init__(
         self,
@@ -117,7 +124,10 @@ class Explorer:
             self._seeded = True
 
         original_commit = self.db.commit
+        original_rollback = self.db.rollback
+        _ORIGINAL_ROLLBACKS[id(self.db)] = original_rollback
         self.db.commit = self.db.flush
+        self.db.rollback = _raise_rollback_requested
         try:
             if self.config.optimizer in {"deterministic", "hybrid"}:
                 self._explore(prefix=(), depth=0, result=result)
@@ -125,6 +135,8 @@ class Explorer:
                 self._hypothesis_explore(result)
         finally:
             self.db.commit = original_commit
+            self.db.rollback = original_rollback
+            _ORIGINAL_ROLLBACKS.pop(id(self.db), None)
 
         result.coverage = coverage_report(self.models, result.transitions)
         return result
@@ -313,13 +325,26 @@ class Explorer:
                 call.action.invoke(self.db, call)
                 external_calls = current_external_calls()
             self.db.flush()
+        except _RollbackRequested as exc:
+            step.rollback()
+            _recover_session(self.db)
+            self._record_violation(
+                result,
+                CheckFailure(
+                    kind="transaction",
+                    name=call.action.name or "action",
+                    message=str(exc),
+                ),
+                steps,
+            )
+            return
         except Discard:
             step.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             return
         except Reject as exc:
             step.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             if call.mode == "unguarded":
                 return
             self._record_violation(
@@ -334,7 +359,7 @@ class Explorer:
             return
         except Exception as exc:
             step.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             failed_external = declared_exception(external_cases, exc)
             if failed_external is not None:
                 self._record_external_case(result, failed_external)
@@ -382,17 +407,17 @@ class Explorer:
             for failure in failures:
                 self._record_violation(result, failure, steps)
             step.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             return
 
         if not events:
             step.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             return
 
         self._explore(prefix=steps, depth=depth + 1, result=result)
         step.rollback()
-        self.db.expire_all()
+        _recover_session(self.db)
 
     def _checks(
         self,
@@ -436,12 +461,14 @@ class Explorer:
         call_count, candidate_index, action_index, mode_index, call, external_cases = item
         desired_mode = self._desired_mode(result)
         action_count = result.actions_executed.get(call.action.name or "action", 0)
+        gap_priority = self._coverage_gap_priority(result, call.action.name or "action")
         external_count = sum(
             result.external_coverage.get(case.name, {}).get(case.outcome, 0)
             for case in external_cases
         )
         return (
             0 if call.mode == desired_mode else 1,
+            -gap_priority,
             action_count,
             external_count,
             call_count,
@@ -461,6 +488,19 @@ class Explorer:
         if guarded / total < self.config.guarded_ratio:
             return "guarded"
         return "unguarded"
+
+    def _coverage_gap_priority(self, result: ExplorationResult, action_name: str) -> int:
+        writes = result.action_writes.get(action_name, {})
+        if not writes:
+            return 0
+        report = coverage_report(self.models, result.transitions)
+        priority = 0
+        for field in writes:
+            field_report = report.get(field)
+            if field_report is None:
+                continue
+            priority += len(field_report.get("unseen", ()))
+        return priority
 
     def _evaluate_plan(
         self,
@@ -483,7 +523,7 @@ class Explorer:
             return PlanEvaluation(steps=tuple(steps))
         finally:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
 
     def _bind_plan_step(self, plan_step: PlanStep) -> StepRecord | None:
         modes = self._modes()
@@ -524,13 +564,21 @@ class Explorer:
                 step.call.action.invoke(self.db, step.call)
                 external_calls = current_external_calls()
             self.db.flush()
+        except _RollbackRequested as exc:
+            savepoint.rollback()
+            _recover_session(self.db)
+            return CheckFailure(
+                kind="transaction",
+                name=step.call.action.name or "action",
+                message=str(exc),
+            )
         except Discard:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             return None
         except Reject as exc:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             if step.call.mode == "unguarded":
                 return None
             return CheckFailure(
@@ -540,7 +588,7 @@ class Explorer:
             )
         except Exception as exc:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             failed_external = declared_exception(step.external_cases, exc)
             if failed_external is not None:
                 if result is not None:
@@ -577,10 +625,10 @@ class Explorer:
         failures = self._checks(events=events, call=step.call, result=result)
         if failures:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             return failures[0]
         savepoint.commit()
-        self.db.expire_all()
+        _recover_session(self.db)
         return None
 
     def _record_violation(
@@ -677,7 +725,7 @@ class Explorer:
             return False
         finally:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
 
     def _replay_step(self, step: StepRecord) -> CheckFailure | None:
         before = snapshot(self.db, self.models)
@@ -686,13 +734,21 @@ class Explorer:
             with external_override(step.external_cases):
                 step.call.action.invoke(self.db, step.call)
             self.db.flush()
+        except _RollbackRequested as exc:
+            savepoint.rollback()
+            _recover_session(self.db)
+            return CheckFailure(
+                kind="transaction",
+                name=step.call.action.name or "action",
+                message=str(exc),
+            )
         except Discard:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             return None
         except Reject as exc:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             if step.call.mode == "unguarded":
                 return None
             return CheckFailure(
@@ -702,7 +758,7 @@ class Explorer:
             )
         except Exception as exc:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             failed_external = declared_exception(step.external_cases, exc)
             if failed_external is not None:
                 return CheckFailure(
@@ -729,10 +785,10 @@ class Explorer:
         failures = self._checks(events=events, call=step.call)
         if failures:
             savepoint.rollback()
-            self.db.expire_all()
+            _recover_session(self.db)
             return failures[0]
         savepoint.commit()
-        self.db.expire_all()
+        _recover_session(self.db)
         return None
 
 
@@ -815,6 +871,26 @@ def _state_key(state: dict[tuple[type, Any], dict[str, Any]], models: list[type]
             if field in values:
                 parts.append(f"{model.__name__}({pk!r}).{field}={values[field]!r}")
     return ", ".join(parts) or "state"
+
+
+def _raise_rollback_requested() -> None:
+    raise _RollbackRequested(
+        "action called session.rollback(); direct mode owns transaction rollback. "
+        "Use a declared reject/discard exception or exercise this path through API mode."
+    )
+
+
+def _recover_session(session: Any) -> None:
+    if getattr(session, "is_active", True) is False:
+        rollback = _ORIGINAL_ROLLBACKS.get(id(session), getattr(session, "rollback", None))
+        if callable(rollback):
+            try:
+                rollback()
+            except Exception:
+                pass
+    expire_all = getattr(session, "expire_all", None)
+    if callable(expire_all):
+        expire_all()
 
 
 def _violation_key(violation: Violation) -> tuple[Any, ...]:

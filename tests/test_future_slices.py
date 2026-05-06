@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
 from typing import Literal
+from uuid import UUID
 
 from sqlalchemy import String
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -26,6 +29,7 @@ from stipulate.core.external import external_case_sets
 from stipulate.core.seed import seed_database
 from stipulate.core.transitions import clear_transition_rules
 from stipulate.mutate.runner import Mutant, MutantResult, MutationResult
+from stipulate.report import exploration_to_dict, mutation_to_dict
 
 
 class ScoreGame(SQLModel, table=True):
@@ -43,6 +47,28 @@ class ScoreEntry(SQLModel, table=True):
 
     id: str = Field(primary_key=True)
     game_id: str = Field(foreign_key="score_game.id")
+
+
+class SeedParent(SQLModel, table=True):
+    __tablename__ = "seed_parent"
+
+    id: str = Field(primary_key=True)
+
+
+class SeedChild(SQLModel, table=True):
+    __tablename__ = "seed_child"
+
+    id: str = Field(primary_key=True)
+    parent_id: str = Field(foreign_key="seed_parent.id")
+
+
+class RichSeed(SQLModel, table=True):
+    __tablename__ = "rich_seed"
+
+    id: UUID = Field(primary_key=True)
+    amount: Decimal
+    day: date
+    code: str = Field(max_length=4)
 
 
 @dataclass(frozen=True)
@@ -89,6 +115,16 @@ def bump_score(game_id: str, db: Session):
     db.commit()
 
 
+def set_score(game_id: str, score: int, db: Session):
+    game = db.get(ScoreGame, game_id)
+    game.score = score
+    db.commit()
+
+
+def rollback_action(game_id: str, db: Session):
+    db.rollback()
+
+
 def lose_score_game(game_id: str, db: Session):
     game = db.get(ScoreGame, game_id)
     game.status = "lost"
@@ -120,6 +156,16 @@ def submitted_scores_have_rank(db: Session):
 @seed(ScoreGame)
 def score_game_seed():
     return ScoreGame(id="s1", status="won", score=10)
+
+
+@seed(SeedChild)
+def child_seed(parent: SeedParent):
+    return SeedChild(id="child", parent_id=parent.id)
+
+
+@seed(SeedParent)
+def parent_seed():
+    return SeedParent(id="parent")
 
 
 def test_external_outcomes_are_exercised_and_report_uncaught_exception():
@@ -180,6 +226,37 @@ def test_boundary_inference_supplements_action_values():
     assert result.action_writes["set_score_status"]["ScoreGame.status"] >= 1
 
 
+def test_boundary_inference_adds_inequality_neighbors():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+
+    @invariant
+    def score_boundary(db: Session):
+        game = db.get(ScoreGame, "s1")
+        assert game.score <= 12
+
+    with Session(engine) as db:
+        result = Explorer(
+            models=[ScoreGame],
+            actions=[
+                action(
+                    fn=set_score,
+                    params={
+                        "game_id": from_seed(ScoreGame),
+                        "score": from_values([]),
+                    },
+                )
+            ],
+            invariants=[score_boundary],
+            seeds=[score_game_seed],
+            db=db,
+            budget=20,
+            max_depth=1,
+        ).run()
+
+    assert 13 in result.boundary_values["score"]
+    assert any(violation.kind == "custom" for violation in result.violations)
+
+
 def test_invariant_reads_skip_unrelated_changes():
     SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
     calls = {"status": 0, "global": 0}
@@ -208,6 +285,21 @@ def test_invariant_reads_skip_unrelated_changes():
     assert result.invariant_coverage == {"global_check": 1}
 
 
+def test_direct_mode_reports_session_rollback_as_transaction_violation():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+    with Session(engine) as db:
+        result = Explorer(
+            models=[ScoreGame],
+            actions=[action(fn=rollback_action, params={"game_id": from_seed(ScoreGame)})],
+            seeds=[score_game_seed],
+            db=db,
+            budget=1,
+            max_depth=1,
+        ).run()
+
+    assert any(violation.kind == "transaction" for violation in result.violations)
+
+
 def test_invariant_read_inference_helper_extracts_simple_model_fields():
     def sample(db: Session):
         assert ScoreGame.status != "lost"
@@ -232,7 +324,24 @@ def test_mutation_report_suggests_how_to_kill_survivors():
     ).report_text()
 
     assert "SURVIVED skip assignment in demo()" in report
-    assert "Suggest: add an invariant or action postcondition" in report
+    assert "Suggest: add a lifecycle invariant or postcondition" in report
+    as_json = mutation_to_dict(
+        MutationResult(
+            results=[
+                MutantResult(
+                    mutant=Mutant(
+                        id="demo",
+                        description="skip assignment in demo()",
+                        fn=lambda: None,
+                        operator="skip_assignment",
+                        target="game.status = 'won'",
+                    ),
+                    killed=False,
+                )
+            ]
+        )
+    )
+    assert "lifecycle invariant" in as_json["survived"][0]["suggestion"]
 
 
 def test_hypothesis_optimizer_finds_and_shrinks_stateful_sequences():
@@ -258,6 +367,7 @@ def test_hypothesis_optimizer_finds_and_shrinks_stateful_sequences():
 
     assert result.optimizer == "hypothesis"
     assert result.optimizer_examples > 0
+    assert exploration_to_dict(result)["optimizer"] == "hypothesis"
     violation = next(v for v in result.violations if v.kind == "forbidden")
     assert violation.sequence == (
         "lose_score_game(game_id='s1')",
@@ -344,6 +454,56 @@ def test_api_explorer_drives_openapi_calls_with_seeded_path_values():
     assert any(violation.kind == "custom" for violation in result.violations)
 
 
+def test_api_explorer_sends_headers_and_flags_undocumented_status():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+
+    class Response:
+        status_code = 409
+
+    class Client:
+        def __init__(self) -> None:
+            self.headers = None
+
+        def request(self, method: str, path: str, **kwargs):
+            self.headers = kwargs.get("headers")
+            return Response()
+
+    openapi = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/games/{game_id}/submit": {
+                "post": {
+                    "parameters": [
+                        {
+                            "name": "game_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+
+    with Session(engine) as db:
+        client = Client()
+        result = ApiExplorer(
+            models=[ScoreGame],
+            db=db,
+            client=client,
+            openapi=openapi,
+            seeds=[score_game_seed],
+            headers={"Authorization": "Bearer test"},
+            budget=1,
+        ).run()
+
+    assert client.headers == {"Authorization": "Bearer test"}
+    assert result.api_status_coverage["POST /games/{game_id}/submit"][409] == 1
+    assert any("undocumented HTTP 409" in violation.message for violation in result.violations)
+
+
 def test_schema_seed_fallback_creates_fk_aware_rows():
     SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
     with Session(engine) as db:
@@ -353,6 +513,25 @@ def test_schema_seed_fallback_creates_fk_aware_rows():
     assert seed_ids[ScoreGame]
     assert seed_ids[ScoreEntry]
     assert entry.game_id == "score_game-seed"
+
+
+def test_seed_generation_orders_overrides_and_handles_richer_scalars():
+    SQLModel.metadata.create_all(engine := create_engine("sqlite:///:memory:"))
+    with Session(engine) as db:
+        seed_ids = seed_database(
+            db,
+            [child_seed, parent_seed],
+            [SeedParent, SeedChild, RichSeed],
+        )
+        child = db.get(SeedChild, "child")
+        rich = db.exec(select(RichSeed)).one()
+
+    assert child.parent_id == "parent"
+    assert seed_ids[RichSeed]
+    assert isinstance(rich.id, UUID)
+    assert rich.amount == Decimal("1")
+    assert rich.day == date(2026, 1, 1)
+    assert len(rich.code) <= 4
 
 
 def test_drift_detects_new_literal_values_and_broken_invariant_refs():
@@ -414,6 +593,7 @@ max_depth = 2
 guarded_ratio = 0.8
 optimizer = "hypothesis"
 api_generator = "schemathesis"
+api_headers = { Authorization = "Bearer test" }
 """
     )
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -427,3 +607,4 @@ api_generator = "schemathesis"
     assert config.guarded_ratio == 0.8
     assert config.optimizer == "hypothesis"
     assert config.api_generator == "schemathesis"
+    assert config.api_headers == {"Authorization": "Bearer test"}

@@ -36,6 +36,7 @@ class ExplorationResult:
     external_coverage: dict[str, dict[str, int]] = field(default_factory=dict)
     external_cross_coverage: dict[str, dict[str, int]] = field(default_factory=dict)
     api_coverage: dict[str, int] = field(default_factory=dict)
+    api_status_coverage: dict[str, dict[int, int]] = field(default_factory=dict)
     mode_coverage: dict[str, int] = field(default_factory=dict)
     invariant_coverage: dict[str, int] = field(default_factory=dict)
     boundary_values: dict[str, list[Any]] = field(default_factory=dict)

@@ -34,6 +34,10 @@ class MutantResult:
     killed: bool
     violations: tuple[Any, ...] = ()
 
+    @property
+    def suggestion(self) -> str:
+        return _suggestion(self.mutant)
+
 
 @dataclass
 class MutationResult:
@@ -76,7 +80,7 @@ class MutationResult:
         if self.survived:
             for result in self.survived:
                 lines.append(f"  SURVIVED {result.mutant.description}")
-                lines.append(f"    Suggest: {_suggestion(result.mutant)}")
+                lines.append(f"    Suggest: {result.suggestion}")
         else:
             lines.append("  none")
         return "\n".join(lines)
@@ -192,10 +196,23 @@ def _source_segment(source: str, node: ast.AST) -> str:
 
 def _suggestion(mutant: Mutant) -> str:
     if mutant.operator == "skip_assignment":
+        field = _assignment_field(mutant.target)
+        if field.endswith(".status") or field == "status":
+            return (
+                f"add a lifecycle invariant or postcondition that requires `{field}` "
+                "to reach the expected terminal state after this action."
+            )
+        if field.endswith(".state") or field == "state":
+            return (
+                f"add an action postcondition that observes `{field}` after the action, "
+                "or forbid the no-op transition this mutant creates."
+            )
+        if field.endswith("_id") or field == "id":
+            return f"add a relationship/FK invariant that observes `{field}`."
+        if any(token in field for token in ("count", "score", "rank", "total")):
+            return f"add a numeric consistency invariant covering `{field}`."
         target = f" `{mutant.target}`" if mutant.target else ""
-        return (
-            f"add an invariant or action postcondition that observes assignment{target}."
-        )
+        return f"add an invariant or action postcondition that observes assignment{target}."
     if mutant.operator == "swap_constant":
         return (
             f"assert the allowed lifecycle state around {mutant.target!r}, "
@@ -205,3 +222,8 @@ def _suggestion(mutant: Mutant) -> str:
         target = f" `{mutant.target}`" if mutant.target else ""
         return f"cover both sides of condition{target} with an invariant or postcondition."
     return "add a business invariant that distinguishes this behavior from the original."
+
+
+def _assignment_field(target: str) -> str:
+    left, _, _ = target.partition("=")
+    return left.strip()

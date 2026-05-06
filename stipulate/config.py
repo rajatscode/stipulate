@@ -27,6 +27,7 @@ class StipulateConfig:
     app: str | None = None
     api_client: str | None = None
     api_generator: str = "openapi"
+    api_headers: dict[str, str] | None = None
     openapi: str | None = None
     budget: int = 500
     max_depth: int = 3
@@ -68,6 +69,7 @@ class StipulateConfig:
             openapi=openapi,
             budget=self.budget,
             generator=self.api_generator,
+            headers=self.api_headers,
         )
 
 
@@ -94,6 +96,7 @@ def load_config(path: str | Path = "pyproject.toml") -> StipulateConfig:
         app=raw.get("app"),
         api_client=raw.get("api_client"),
         api_generator=raw.get("api_generator", "openapi"),
+        api_headers=raw.get("api_headers"),
         openapi=raw.get("openapi"),
         budget=int(raw.get("budget", 500)),
         max_depth=int(raw.get("max_depth", 3)),
