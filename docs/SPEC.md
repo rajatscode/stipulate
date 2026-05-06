@@ -343,13 +343,15 @@ with engine.connect() as conn:
                 try:
                     result = call_action(session, action_call)
                 except DiscardOrReject:
-                    step_sp.rollback()  # undo any dirty ORM state from failed call
+                    step_sp.rollback()
+                    session.expire_all()  # clear stale ORM identity map
                     continue
                 except Exception:
                     step_sp.rollback()
+                    session.expire_all()
                     report_finding(...)
                     continue
-                step_sp.release()  # success: keep changes, proceed to checks
+                step_sp.commit()  # success: release savepoint, keep changes
                 session.flush()
                 snapshot_and_check(session)
             seq_sp.rollback()  # restore seed state for next sequence
@@ -359,9 +361,10 @@ with engine.connect() as conn:
 - **Sequence savepoint** (`seq_sp`): wraps the entire multi-step
   sequence. Rolled back after every sequence to restore seed state.
 - **Step savepoint** (`step_sp`): wraps each individual action call.
-  Released on success (changes kept for subsequent steps and checks).
-  Rolled back on discard/reject/error (prevents dirty ORM state from
-  leaking into the sequence).
+  Committed on success (releases savepoint, keeps changes for
+  subsequent steps and checks). Rolled back on discard/reject/error,
+  followed by `session.expire_all()` to clear stale in-memory ORM
+  objects whose DB rows were reverted by the rollback.
 - `session.commit = session.flush`: mutations commit normally from
   their perspective; changes are flushed to the DB but the sequence
   savepoint is never released.
@@ -791,7 +794,7 @@ Schemas and code evolve. Stipulate detects when changes create gaps:
 ### 10. pytest Integration
 
 ```python
-# conftest.py
+# conftest.py — after strengthening invariants via mutation feedback
 from stipulate.pytest import create_explorer
 from myapp.actions import (
     reveal_action, flag_action, check_win_action, delete_game_action
