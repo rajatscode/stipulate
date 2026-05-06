@@ -597,7 +597,7 @@ Transitions fall into three buckets:
 - **Observed** — transitions that were exercised during exploration.
 - **Unseen** — all other valid enum pairs that were not observed and
   not forbidden. The denominator is every (from, to) pair in the
-  Literal/enum domain, minus forbidden pairs. Informational, not
+  Literal/enum domain, minus forbidden and ignored pairs. Informational, not
   failures. Some may be impossible by business logic, some may be
   genuine gaps. The developer decides which matter.
 - **Forbidden** — transitions declared via `forbid_transition`. These
@@ -621,7 +621,7 @@ Game.status transitions (12 pairs - 4 forbidden - 2 ignored = 6):
   Forbidden:
     lost → won             ASSERTION (violated 1x — see check_win bug)
     lost → playing         assertion (not triggered)
-    won → lost             assertion (not triggered)
+    won → lost             ASSERTION (violated 1x — reveal_cell has no status guard)
     won → playing          assertion (not triggered)
 
 Cell.state transitions (denominator: 6 pairs - 2 forbidden = 4):
@@ -670,7 +670,8 @@ if cell.is_mine:  →  if not cell.is_mine:
 For each mutant:
 1. AST-transform the function, compile, monkey-patch the module
 2. Re-run the exploration loop (fast — direct mode, in-process)
-3. Check if any invariant or forbidden transition fires
+3. A mutant is killed if any check fires: schema checks, custom
+   invariants, action postconditions, or forbidden transitions
 4. Un-patch, move to next mutant
 
 Limitation: in-process monkey-patching works for functions that don't
@@ -765,13 +766,12 @@ During exploration:
 2. For each declared outcome, it replaces the call with the mock
    return value (or raises the mock exception).
 3. If the mutation doesn't catch a declared exception (e.g., timeout
-   propagates out of submit_score), that is a valid exploration path —
-   the mutation "failed." The engine flushes the session (to surface
-   any pending writes), then checks invariants against the DB state.
-   If the session is in a broken state (e.g., transaction aborted),
-   the engine reports the exception as a finding: "submit_score does
-   not handle timeout — exception propagates, leaving DB in unknown
-   state." Uncaught external exceptions reveal missing error handling.
+   propagates out of submit_score), the engine rolls back the per-step
+   savepoint (the mutation didn't complete cleanly) and reports:
+   "submit_score does not handle timeout — exception propagates."
+   DB invariants are NOT checked on the rolled-back state — the
+   mutation's partial writes are discarded. The finding is the
+   missing error handling itself, not the DB state it left behind.
 4. Checks all invariants after each outcome.
 5. Cross-product: if the game is in 4 possible states × 4 leaderboard
    outcomes = 16 combinations, all explored automatically.
@@ -965,7 +965,7 @@ def win_detected(db: Session, game_id: str):
 The demo uses a Minesweeper API (2 models, 4 mutations) with a 3x3
 board and 1 mine. Two moments:
 
-### Wow 1: "Two invariants, found two bugs and a missing guard"
+### Wow 1: "Two invariants, found four bugs"
 
 1. Show the SQLModel models (Game, Cell) — standard code, nothing new.
 2. Show two `@invariant` decorators (revealed mine = lost, mine counts
@@ -989,6 +989,11 @@ VIOLATION: [forbidden] Cell.state: revealed → flagged
    cells," but the function accepts any cell. Cell (1,1) was pre-revealed
    in the seed.)
 
+VIOLATION: [forbidden] Game.status: won → lost
+  After: reveal_cell(2, 2) → check_win() → [unguarded] reveal_cell(0, 0)
+  Game was 'won' after check_win. Unguarded reveal_cell on the mine
+  set status to 'lost'. reveal_cell has no status guard.
+
 VIOLATION: [schema] orphan_detection
   After: delete_game('g1')
   Cell(game_id='g1') references deleted Game. delete_game deletes the
@@ -1000,14 +1005,16 @@ Transition coverage (excluding forbidden + ignored):
   Total: 4 observed, 6 unseen
 ```
 
-Two business logic bugs (check_win ignores loss, flag_cell has no
-guard) and one structural bug, zero test scenarios.
+Three missing guards (check_win ignores loss, flag_cell accepts revealed
+cells, reveal_cell accepts won/lost games), one structural bug, zero
+test scenarios.
 
 ### Wow 2: "Mutation testing shows what your invariants miss"
 
-1. Fix all three bugs (add guard to flag_cell that raises ValueError,
-   add loss-state check to check_win, add cascade delete to
-   delete_game). Update flag_action to add `rejects=[ValueError]`.
+1. Fix all four bugs (add status guard to reveal_cell, add guard to
+   flag_cell, add loss-state check to check_win, add cascade delete
+   to delete_game). Update reveal_action and flag_action to add
+   `rejects=[ValueError]`.
 2. Run `stipulate mutate`.
 3. Reports:
 
