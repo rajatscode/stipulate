@@ -199,11 +199,16 @@ invariants = [
     "myapp.invariants:mine_counts_accurate",
 ]
 # postconditions added later via mutation feedback — see Demo Plan
+transitions = "myapp.transitions"  # module with forbid_transition / ignore_transition calls
 seeds = [
     "myapp.seeds:game_seed",
     "myapp.seeds:cell_seeds",
 ]
 ```
+
+The `transitions` entry points to a module that Stipulate imports to
+register `forbid_transition` and `ignore_transition` calls. These are
+module-level side effects, like pytest plugin registration.
 
 Actions are the core registration unit, not raw functions. FastAPI route
 auto-discovery is a future improvement, not v1.
@@ -348,11 +353,15 @@ with engine.connect() as conn:
                     result = call_action(session, action_call)
                 except DiscardOrReject:
                     step_sp.rollback()
-                    session.expire_all()  # clear stale ORM identity map
+                    session.close()
+                    session = Session(bind=conn)  # fresh session, clean identity map
+                    session.commit = session.flush
                     continue
                 except Exception:
                     step_sp.rollback()
-                    session.expire_all()
+                    session.close()
+                    session = Session(bind=conn)
+                    session.commit = session.flush
                     report_finding(...)
                     continue
                 step_sp.commit()  # success: release savepoint, keep changes
@@ -366,9 +375,11 @@ with engine.connect() as conn:
   sequence. Rolled back after every sequence to restore seed state.
 - **Step savepoint** (`step_sp`): wraps each individual action call.
   Committed on success (releases savepoint, keeps changes for
-  subsequent steps and checks). Rolled back on discard/reject/error,
-  followed by `session.expire_all()` to clear stale in-memory ORM
-  objects whose DB rows were reverted by the rollback.
+  subsequent steps and checks). Rolled back on discard/reject/error.
+  After rollback, the session is closed and a fresh session is created
+  on the same connection — this clears stale ORM identity map objects
+  and avoids the "session in failed transaction" state that
+  `expire_all()` alone cannot recover from.
 - `session.commit = session.flush`: mutations commit normally from
   their perspective; changes are flushed to the DB but the sequence
   savepoint is never released.
@@ -597,13 +608,13 @@ This keeps the coverage report focused on transitions the developer
 cares about, without asserting they're impossible.
 
 ```
-Game.status transitions (denominator: 12 pairs - 4 forbidden = 8):
-  Observed: 2/8
+Game.status transitions (12 pairs - 4 forbidden - 2 ignored = 6):
+  Observed: 2/6
     playing → won          ✓ (1x)
     playing → lost         ✓ (2x)
-  Unseen: 6/8
-    ready → playing        ready → lost         ready → won
-    playing → ready        lost → ready         won → ready
+  Unseen: 4/6
+    ready → playing        ready → lost
+    ready → won            playing → ready
   Forbidden:
     lost → won             ASSERTION (violated 1x — see check_win bug)
     lost → playing         assertion (not triggered)
@@ -980,10 +991,10 @@ VIOLATION: [schema] orphan_detection
   Cell(game_id='g1') references deleted Game. delete_game deletes the
   parent without cleaning up child Cells (SQLite FK enforcement is off).
 
-Transition coverage (excluding forbidden):
-  Game.status: 2 observed / 8 non-forbidden pairs
-  Cell.state:  2 observed / 4 non-forbidden pairs
-  Total: 4 observed, 8 unseen
+Transition coverage (excluding forbidden + ignored):
+  Game.status: 2 observed / 6 reportable pairs
+  Cell.state:  2 observed / 4 reportable pairs
+  Total: 4 observed, 6 unseen
 ```
 
 Two business logic bugs (check_win ignores loss, flag_cell has no
